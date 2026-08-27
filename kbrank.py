@@ -7,8 +7,10 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
+from typing import Callable
 
 ROWS, COLS = 3, 10
 HALF_COLS = COLS // 2          # 5
@@ -87,6 +89,72 @@ def render_grid(a_id: str, b_id: str) -> str:
         return marks.get(key.id, ".")
 
     return "\n".join(_grid_lines(cell_for_key))
+
+
+# ----------------------------------------------------------------------------
+# Bigram (two-key sequence) item space, parsing and rendering
+# ----------------------------------------------------------------------------
+
+BIGRAM_SEP = ">"
+BIGRAM_IDS = [f"{a}{BIGRAM_SEP}{b}" for a in CANON_IDS for b in CANON_IDS]
+N_BIGRAMS = N_POS * N_POS  # 225
+
+
+def split_bigram(bigram_id: str) -> tuple[str, str]:
+    first, second = bigram_id.split(BIGRAM_SEP)
+    return first, second
+
+
+def describe_bigram(bigram_id: str) -> str:
+    first, second = split_bigram(bigram_id)
+    k1, k2 = KEYS_BY_ID[first], KEYS_BY_ID[second]
+    return (
+        f"row {k1.row} cols {k1.col}|{mirror_col(k1.col)} -> "
+        f"row {k2.row} cols {k2.col}|{mirror_col(k2.col)}"
+    )
+
+
+_RC_RE = re.compile(r"r(\d+)c(\d+)", re.IGNORECASE)
+_TUPLE_RE = re.compile(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)")
+
+
+def parse_bigram(spec: str) -> str:
+    found = _RC_RE.findall(spec) or _TUPLE_RE.findall(spec)
+    ids = []
+    for r, c in found:
+        r, c = int(r), int(c)
+        if not (1 <= r <= ROWS and 1 <= c <= COLS):
+            found = []
+            break
+        ids.append(canonical_id(f"r{r}c{c}"))
+    if len(found) != 2:
+        print(
+            f"cannot parse sequence {spec!r}; use 'r2c1>r2c2' or '(2,1)-(2,2)' "
+            f"with row 1-{ROWS}, col 1-{COLS}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return f"{ids[0]}{BIGRAM_SEP}{ids[1]}"
+
+
+def render_sequence_grid(bigram_id: str, upper: str, lower: str) -> str:
+    first, second = split_bigram(bigram_id)
+    marks: dict[str, str] = {}
+    for pos, kid in ((1, first), (2, second)):
+        marks[kid] = marks.get(kid, "") + f"{upper}{pos}"
+        mid = mirror_id(kid)
+        marks[mid] = marks.get(mid, "") + f"{lower}{pos}"
+    return "\n".join(_grid_lines(lambda key: marks.get(key.id, ".")))
+
+
+def render_bigram_pair(id1: str, id2: str) -> str:
+    return (
+        "Sequence 1:\n"
+        f"{render_sequence_grid(id1, 'A', 'a')}\n"
+        "Sequence 2:\n"
+        f"{render_sequence_grid(id2, 'B', 'b')}\n"
+        "Lowercase cells are the same sequence on the other hand."
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -171,6 +239,64 @@ def load_state(path: str, seed: int | None = None) -> dict:
     return state
 
 
+def load_bigram_state(path: str, seed: int | None = None) -> dict:
+    if not os.path.exists(path):
+        return {
+            "version": 1,
+            "kind": "bigrams",
+            "grid": [ROWS, COLS],
+            "symmetric": True,
+            "seed": seed if seed is not None else random.randrange(2**31),
+            "comparisons": [],
+        }
+
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    try:
+        state = json.loads(text)
+    except json.JSONDecodeError as e:
+        print(f"state file {path} is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if state.get("kind") != "bigrams" or state.get("version") != 1:
+        print(
+            f"state file {path} is not a kbrank bigram session; use --state to start a new file",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if state.get("grid") != [ROWS, COLS]:
+        print(
+            f"state file {path} is not a 3x10 session; use --state to start a new file",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    valid_ids = set(BIGRAM_IDS)
+    for idx, cmp in enumerate(state.get("comparisons", [])):
+        if cmp.get("a") not in valid_ids or cmp.get("b") not in valid_ids:
+            print(
+                f"state file {path}: comparison {idx} has an invalid sequence id",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if cmp.get("result") not in ("a", "b", "tie"):
+            print(
+                f"state file {path}: comparison {idx} has an invalid result",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    if seed is not None:
+        print(
+            f"note: --seed ignored; resuming with stored seed {state['seed']}",
+            file=sys.stderr,
+        )
+
+    return state
+
+
 def save_state(path: str, state: dict) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -190,12 +316,12 @@ def fit_bt(key_ids: list[str], comparisons: list[dict]) -> dict[str, float]:
 
     # Every key gets one virtual tie against a fictional opponent of strength 1.0.
     w = [0.5] * n_keys
-    n = [[0] * n_keys for _ in range(n_keys)]
+    opp: list[dict[int, int]] = [dict() for _ in range(n_keys)]
 
     for c in comparisons:
         i, j = idx[c["a"]], idx[c["b"]]
-        n[i][j] += 1
-        n[j][i] += 1
+        opp[i][j] = opp[i].get(j, 0) + 1
+        opp[j][i] = opp[j].get(i, 0) + 1
         if c["result"] == "a":
             w[i] += 1
         elif c["result"] == "b":
@@ -208,14 +334,10 @@ def fit_bt(key_ids: list[str], comparisons: list[dict]) -> dict[str, float]:
     for _ in range(10000):
         new_pi = [0.0] * n_keys
         for i in range(n_keys):
-            denom = 1.0 / (pi[i] + 1.0)
-            row = n[i]
-            for j in range(n_keys):
-                if j == i:
-                    continue
-                nij = row[j]
-                if nij:
-                    denom += nij / (pi[i] + pi[j])
+            p = pi[i]
+            denom = 1.0 / (p + 1.0)
+            for j, nij in opp[i].items():
+                denom += nij / (p + pi[j])
             new_pi[i] = w[i] / denom
 
         gmean = math.exp(sum(math.log(p) for p in new_pi) / n_keys)
@@ -301,45 +423,96 @@ class PairSampler:
         return self.rng.random() < 0.5
 
 
+class BalancedPairSampler:
+    """Always compares the two least-compared items, so coverage stays even over a
+    space too large to exhaust. Pure function of (seed, comparison history), so resume
+    and undo are deterministic without persisting a cursor."""
+
+    def __init__(self, item_ids: list[str], seed: int):
+        self.items = list(item_ids)
+        rng = random.Random(seed)
+        order = list(range(len(self.items)))
+        rng.shuffle(order)
+        self.tiebreak = {self.items[i]: pos for pos, i in enumerate(order)}
+
+    def next_pair(self, comparisons: list[dict]) -> tuple[str, str]:
+        counts = {k: 0 for k in self.items}
+        seen = set()
+        for c in comparisons:
+            counts[c["a"]] += 1
+            counts[c["b"]] += 1
+            seen.add(frozenset((c["a"], c["b"])))
+        tb = self.tiebreak
+        a = min(self.items, key=lambda k: (counts[k], tb[k]))
+        b = min(
+            (k for k in self.items if k != a),
+            key=lambda k: (frozenset((a, k)) in seen, counts[k], tb[k]),
+        )
+        return a, b
+
+
 # ----------------------------------------------------------------------------
 # Reporting (shared by `ask`'s end-of-session summary and `report`)
 # ----------------------------------------------------------------------------
 
 
-def _build_ranking(state: dict, bootstrap: int) -> tuple[list[dict], list[str]]:
-    comparisons = state["comparisons"]
-    strengths = fit_bt(CANON_IDS, comparisons)
+def _fit_ranking(
+    item_ids: list[str], comparisons: list[dict], seed: int, bootstrap: int
+) -> tuple[list[dict], list[str]]:
+    """rows: {"rank", "id", "utility", "rank_ci", "n_comparisons"}; plus zero-comparison ids."""
+    strengths = fit_bt(item_ids, comparisons)
 
-    cmps_count = {k: 0 for k in CANON_IDS}
+    cmps_count = {k: 0 for k in item_ids}
     for c in comparisons:
         cmps_count[c["a"]] += 1
         cmps_count[c["b"]] += 1
 
-    rng = random.Random(state["seed"])
-    ci = bootstrap_ranks(CANON_IDS, comparisons, bootstrap, rng)
+    rng = random.Random(seed)
+    ci = bootstrap_ranks(item_ids, comparisons, bootstrap, rng)
 
-    order = sorted(range(len(CANON_IDS)), key=lambda i: (-strengths[CANON_IDS[i]], i))
+    order = sorted(range(len(item_ids)), key=lambda i: (-strengths[item_ids[i]], i))
 
     ranking = []
     for rank, i in enumerate(order, start=1):
-        kid = CANON_IDS[i]
-        key = KEYS_BY_ID[kid]
+        kid = item_ids[i]
         rc = ci.get(kid)
         ranking.append(
             {
                 "rank": rank,
                 "id": kid,
-                "row": key.row,
-                "col": key.col,
-                "mirror_col": mirror_col(key.col),
                 "utility": round(strengths[kid], 4),
                 "rank_ci": [rc[0], rc[1]] if rc else None,
                 "n_comparisons": cmps_count[kid],
             }
         )
 
-    zero_keys = [k for k in CANON_IDS if cmps_count[k] == 0]
+    zero_ids = [k for k in item_ids if cmps_count[k] == 0]
+    return ranking, zero_ids
+
+
+def _build_ranking(state: dict, bootstrap: int) -> tuple[list[dict], list[str]]:
+    ranking, zero_keys = _fit_ranking(CANON_IDS, state["comparisons"], state["seed"], bootstrap)
+    for row in ranking:
+        key = KEYS_BY_ID[row["id"]]
+        row["row"] = key.row
+        row["col"] = key.col
+        row["mirror_col"] = mirror_col(key.col)
     return ranking, zero_keys
+
+
+def _build_bigram_ranking(state: dict, bootstrap: int) -> tuple[list[dict], list[str]]:
+    ranking, zero_ids = _fit_ranking(BIGRAM_IDS, state["comparisons"], state["seed"], bootstrap)
+    for row in ranking:
+        first, second = split_bigram(row["id"])
+        for label, kid in (("from", first), ("to", second)):
+            key = KEYS_BY_ID[kid]
+            row[label] = {
+                "id": kid,
+                "row": key.row,
+                "col": key.col,
+                "mirror_col": mirror_col(key.col),
+            }
+    return ranking, zero_ids
 
 
 def _print_report(state: dict, bootstrap: int, json_output: bool) -> None:
@@ -394,46 +567,147 @@ def _print_report(state: dict, bootstrap: int, json_output: bool) -> None:
     print("\n".join(_grid_lines(lambda key: str(rank_by_key[canonical_id(key.id)]))))
 
 
+def _print_bigram_report(state: dict, bootstrap: int, json_output: bool, top: int) -> None:
+    comparisons = state["comparisons"]
+    ranking, zero_ids = _build_bigram_ranking(state, bootstrap)
+
+    if len(comparisons) < 2 * N_BIGRAMS:
+        print(
+            f"only {len(comparisons)} comparisons for {N_BIGRAMS} sequences; "
+            "ranking is weak - run 'kbrank ask --mode bigrams' for more",
+            file=sys.stderr,
+        )
+    if zero_ids:
+        print(
+            f"{len(zero_ids)} of {N_BIGRAMS} sequences have zero comparisons",
+            file=sys.stderr,
+        )
+
+    if json_output:
+        out = {
+            "mode": "bigrams",
+            "n_items": N_BIGRAMS,
+            "n_comparisons": len(comparisons),
+            "grid": [ROWS, COLS],
+            "symmetric": True,
+            "ranking": ranking,
+        }
+        print(json.dumps(out))
+        return
+
+    print(
+        f"{N_BIGRAMS} two-key sequences over {N_POS} mirror positions (repeats included), "
+        f"{len(comparisons)} comparisons"
+    )
+    print(
+        "Utility values are log-strengths from a Bradley-Terry fit; "
+        "only their ORDER is meaningful."
+    )
+    print()
+    print(
+        f"{'Rank':>4}  {'Sequence':<14}  {'From':>12}  {'To':>12}   "
+        f"{'Utility':>7}  {'Rank 95% CI':>12}   {'Cmps':>4}"
+    )
+
+    def _row_line(row: dict) -> str:
+        ci_str = f"{row['rank_ci'][0]}-{row['rank_ci'][1]}" if row["rank_ci"] else "-"
+        from_str = f"r{row['from']['row']} c{row['from']['col']}|{row['from']['mirror_col']}"
+        to_str = f"r{row['to']['row']} c{row['to']['col']}|{row['to']['mirror_col']}"
+        return (
+            f"{row['rank']:>4}  {row['id']:<14}  {from_str:>12}  {to_str:>12}   "
+            f"{row['utility']:>+7.2f}  {ci_str:>12}   {row['n_comparisons']:>4}"
+        )
+
+    if top > 0 and 2 * top < len(ranking):
+        for row in ranking[:top]:
+            print(_row_line(row))
+        print(f"  ... {len(ranking) - 2 * top} sequences omitted (--top 0 for all) ...")
+        for row in ranking[-top:]:
+            print(_row_line(row))
+    else:
+        for row in ranking:
+            print(_row_line(row))
+
+
+def _print_bigram_compare(state: dict, bootstrap: int, specs: list[str]) -> None:
+    left, right = (parse_bigram(s) for s in specs)
+    ranking, _ = _build_bigram_ranking(state, bootstrap)
+    by_id = {row["id"]: row for row in ranking}
+
+    def _stat_line(seq: str) -> str:
+        row = by_id[seq]
+        if row["n_comparisons"] == 0:
+            print(
+                f"warning: {seq} has no recorded comparisons; its utility is the prior",
+                file=sys.stderr,
+            )
+        return (
+            f"{seq:<10}  rank {row['rank']:>3}/{N_BIGRAMS}   "
+            f"utility {row['utility']:>+6.2f}   cmps {row['n_comparisons']:>4}"
+        )
+
+    print(_stat_line(left))
+    print(_stat_line(right))
+    print()
+
+    if left == right:
+        print(f"{left} compared with itself")
+        return
+
+    u_left, u_right = by_id[left]["utility"], by_id[right]["utility"]
+    gap = u_left - u_right
+    if abs(gap) < 1e-9:
+        print(f"{left} and {right} are indistinguishable (gap +0.00, P = 0.50)")
+        return
+
+    p = 1.0 / (1.0 + math.exp(-gap))
+    better = left if gap > 0 else right
+    print(f"{better} is better: utility gap {abs(gap):+.2f}, P(prefer first) = {p:.2f}")
+
+
 # ----------------------------------------------------------------------------
 # `ask` subcommand
 # ----------------------------------------------------------------------------
 
+STATE_DEFAULTS = {"keys": "./kbrank-session.json", "bigrams": "./kbrank-bigram-session.json"}
+BOOTSTRAP_DEFAULTS = {"keys": 200, "bigrams": 50}
+BIGRAM_SESSION_QUESTIONS = 50  # default questions added per bigrams `ask` run
 
-def cmd_ask(args: argparse.Namespace) -> int:
-    state = load_state(args.state, seed=args.seed)
-    skip = len(state["comparisons"]) % N_PAIRS
-    sampler = PairSampler(state["seed"], skip)
-    target = args.n
 
+@dataclasses.dataclass
+class AskMode:
+    next_pair: Callable[[dict], tuple[str, str]]  # state -> unswapped (a, b)
+    swap: Callable[[dict], bool]                  # state -> present in swapped order?
+    render: Callable[[str, str], str]              # (id1, id2) -> printable block
+    question: str
+    options: Callable[[str, str], str]             # (id1, id2) -> the two option lines
+
+
+def _run_ask_session(state: dict, path: str, target: int, mode: AskMode) -> int:
     current: tuple[str, str] | None = None
 
     while len(state["comparisons"]) < target:
         if current is None:
-            current = sampler.next_pair()
+            current = mode.next_pair(state)
         a_id, b_id = current
-        swap = sampler.presentation_swap()
+        swap = mode.swap(state)
         choice1_id, choice2_id = (b_id, a_id) if swap else (a_id, b_id)
 
         count = len(state["comparisons"])
         print(f"[ {count + 1}/{target} ]  total recorded: {count}")
         print()
-        print(render_grid(choice1_id, choice2_id))
-        print("Mirror cells (a)/[b] are the same position on the other hand.")
+        print(mode.render(choice1_id, choice2_id))
         print()
-        print("Which key position is more comfortable to type?")
-        k1, k2 = KEYS_BY_ID[choice1_id], KEYS_BY_ID[choice2_id]
-        print(
-            f"  1) (A) row {k1.row}, cols {k1.col}|{mirror_col(k1.col)}      "
-            f"2) [B] row {k2.row}, cols {k2.col}|{mirror_col(k2.col)}"
-        )
+        print(mode.question)
+        print(mode.options(choice1_id, choice2_id))
         print("  = equal   u undo   q save & quit")
 
         try:
             raw = input("> ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
-            save_state(args.state, state)
-            print(f"saved {len(state['comparisons'])} comparisons to {args.state}")
+            save_state(path, state)
+            print(f"saved {len(state['comparisons'])} comparisons to {path}")
             return 0
 
         if raw in ("1", "2"):
@@ -441,31 +715,80 @@ def cmd_ask(args: argparse.Namespace) -> int:
             state["comparisons"].append(
                 {"a": choice1_id, "b": choice2_id, "result": result, "t": time.time()}
             )
-            save_state(args.state, state)
+            save_state(path, state)
             current = None
         elif raw in ("=", "e"):
             state["comparisons"].append(
                 {"a": choice1_id, "b": choice2_id, "result": "tie", "t": time.time()}
             )
-            save_state(args.state, state)
+            save_state(path, state)
             current = None
         elif raw == "u":
             if state["comparisons"]:
                 popped = state["comparisons"].pop()
-                save_state(args.state, state)
+                save_state(path, state)
                 current = (popped["a"], popped["b"])
             else:
                 print("nothing to undo")
         elif raw == "q":
-            save_state(args.state, state)
-            print(f"saved {len(state['comparisons'])} comparisons to {args.state}")
+            save_state(path, state)
+            print(f"saved {len(state['comparisons'])} comparisons to {path}")
             return 0
         else:
             print("unrecognised input")
 
-    save_state(args.state, state)
-    print(f"saved {len(state['comparisons'])} comparisons to {args.state}")
-    _print_report(state, bootstrap=200, json_output=False)
+    save_state(path, state)
+    print(f"saved {len(state['comparisons'])} comparisons to {path}")
+    return 0
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    path = args.state or STATE_DEFAULTS[args.mode]
+
+    if args.mode == "keys":
+        state = load_state(path, seed=args.seed)
+        sampler = PairSampler(state["seed"], len(state["comparisons"]) % N_PAIRS)
+
+        def _options(id1: str, id2: str) -> str:
+            k1, k2 = KEYS_BY_ID[id1], KEYS_BY_ID[id2]
+            return (
+                f"  1) (A) row {k1.row}, cols {k1.col}|{mirror_col(k1.col)}      "
+                f"2) [B] row {k2.row}, cols {k2.col}|{mirror_col(k2.col)}"
+            )
+
+        mode = AskMode(
+            next_pair=lambda s: sampler.next_pair(),
+            swap=lambda s: sampler.presentation_swap(),
+            render=lambda id1, id2: (
+                render_grid(id1, id2)
+                + "\nMirror cells (a)/[b] are the same position on the other hand."
+            ),
+            question="Which key position is more comfortable to type?",
+            options=_options,
+        )
+        target = args.n if args.n is not None else N_PAIRS
+        _run_ask_session(state, path, target, mode)
+        if len(state["comparisons"]) >= target:
+            _print_report(state, bootstrap=200, json_output=False)
+        return 0
+
+    state = load_bigram_state(path, seed=args.seed)
+    sampler = BalancedPairSampler(BIGRAM_IDS, state["seed"])
+    mode = AskMode(
+        next_pair=lambda s: sampler.next_pair(s["comparisons"]),
+        swap=lambda s: random.Random(f"{s['seed']}:{len(s['comparisons'])}").random() < 0.5,
+        render=render_bigram_pair,
+        question="Which two-key sequence is more comfortable to type in order?",
+        options=lambda id1, id2: (
+            f"  1) A: {describe_bigram(id1)}\n  2) B: {describe_bigram(id2)}"
+        ),
+    )
+    target = (
+        args.n if args.n is not None else len(state["comparisons"]) + BIGRAM_SESSION_QUESTIONS
+    )
+    _run_ask_session(state, path, target, mode)
+    if len(state["comparisons"]) >= target:
+        _print_bigram_report(state, bootstrap=50, json_output=False, top=20)
     return 0
 
 
@@ -475,11 +798,28 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
 
 def cmd_report(args: argparse.Namespace) -> int:
-    state = load_state(args.state)
+    path = args.state or STATE_DEFAULTS[args.mode]
+    bootstrap = args.bootstrap if args.bootstrap is not None else BOOTSTRAP_DEFAULTS[args.mode]
+
+    if args.mode == "keys":
+        if args.compare:
+            print("--compare is only available with --mode bigrams", file=sys.stderr)
+            return 2
+        state = load_state(path)
+        if not state["comparisons"]:
+            print(f"no comparisons recorded in {path}", file=sys.stderr)
+            return 1
+        _print_report(state, bootstrap=bootstrap, json_output=args.json)
+        return 0
+
+    state = load_bigram_state(path)
     if not state["comparisons"]:
-        print(f"no comparisons recorded in {args.state}", file=sys.stderr)
+        print(f"no comparisons recorded in {path}", file=sys.stderr)
         return 1
-    _print_report(state, bootstrap=args.bootstrap, json_output=args.json)
+    if args.compare:
+        _print_bigram_compare(state, bootstrap=0, specs=args.compare)
+    else:
+        _print_bigram_report(state, bootstrap=bootstrap, json_output=args.json, top=args.top)
     return 0
 
 
@@ -493,15 +833,19 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     ask_p = sub.add_parser("ask", help="collect pairwise comfort comparisons")
-    ask_p.add_argument("--state", default="./kbrank-session.json")
-    ask_p.add_argument("-n", type=int, default=N_PAIRS)
+    ask_p.add_argument("--mode", choices=("keys", "bigrams"), default="keys")
+    ask_p.add_argument("--state", default=None)
+    ask_p.add_argument("-n", type=int, default=None)
     ask_p.add_argument("--seed", type=int, default=None)
     ask_p.set_defaults(func=cmd_ask)
 
     report_p = sub.add_parser("report", help="print the recovered rank table")
-    report_p.add_argument("--state", default="./kbrank-session.json")
-    report_p.add_argument("--bootstrap", type=int, default=200)
+    report_p.add_argument("--mode", choices=("keys", "bigrams"), default="keys")
+    report_p.add_argument("--state", default=None)
+    report_p.add_argument("--bootstrap", type=int, default=None)
     report_p.add_argument("--json", action="store_true")
+    report_p.add_argument("--top", type=int, default=20)
+    report_p.add_argument("--compare", nargs=2, metavar=("SEQ", "SEQ"), default=None)
     report_p.set_defaults(func=cmd_report)
 
     return parser
