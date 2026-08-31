@@ -950,10 +950,32 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     ask_p = sub.add_parser("ask", help="collect pairwise comfort comparisons")
-    ask_p.add_argument("--mode", choices=("keys", "bigrams"), default="keys")
-    ask_p.add_argument("--state", default=None)
-    ask_p.add_argument("-n", type=int, default=None)
-    ask_p.add_argument("--seed", type=int, default=None)
+    ask_p.add_argument(
+        "--mode",
+        choices=("keys", "bigrams"),
+        default="keys",
+        help="item type to compare: individual key positions or two-key sequences",
+    )
+    ask_p.add_argument(
+        "--state",
+        default=None,
+        help="session JSON file to load/save (default: ./kbrank-session.json, "
+             "or ./kbrank-bigram-session.json for --mode bigrams)",
+    )
+    ask_p.add_argument(
+        "-n",
+        type=int,
+        default=None,
+        help="number of comparisons to ask this run (default: fills out the full "
+             "pair space, or a fixed batch size with --only)",
+    )
+    ask_p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="RNG seed for pair sampling; only used the first time a state file "
+             "is created, then persisted in it",
+    )
     ask_p.add_argument(
         "--only",
         action="extend",
@@ -968,12 +990,39 @@ def build_parser() -> argparse.ArgumentParser:
     ask_p.set_defaults(func=cmd_ask)
 
     report_p = sub.add_parser("report", help="print the recovered rank table")
-    report_p.add_argument("--mode", choices=("keys", "bigrams"), default="keys")
-    report_p.add_argument("--state", default=None)
-    report_p.add_argument("--bootstrap", type=int, default=None)
-    report_p.add_argument("--json", action="store_true")
-    report_p.add_argument("--top", type=int, default=20)
-    report_p.add_argument("--compare", nargs=2, metavar=("SEQ", "SEQ"), default=None)
+    report_p.add_argument(
+        "--mode",
+        choices=("keys", "bigrams"),
+        default="keys",
+        help="item type to report on: individual key positions or two-key sequences",
+    )
+    report_p.add_argument(
+        "--state",
+        default=None,
+        help="session JSON file to read (default: ./kbrank-session.json, "
+             "or ./kbrank-bigram-session.json for --mode bigrams)",
+    )
+    report_p.add_argument(
+        "--bootstrap",
+        type=int,
+        default=None,
+        help="bootstrap resamples for rank confidence intervals (default: 200 "
+             "for keys, 50 for bigrams)",
+    )
+    report_p.add_argument(
+        "--json", action="store_true", help="print the rank table as JSON instead of text"
+    )
+    report_p.add_argument(
+        "--top", type=int, default=20, help="number of top-ranked items to print"
+    )
+    report_p.add_argument(
+        "--compare",
+        nargs=2,
+        metavar=("SEQ", "SEQ"),
+        default=None,
+        help="skip the rank table and print a head-to-head comparison of two "
+             "items instead",
+    )
     report_p.set_defaults(func=cmd_report)
 
     return parser
