@@ -610,24 +610,36 @@ class BalancedPairSampler:
 
 
 def _fit_ranking(
-    item_ids: list[str], comparisons: list[dict], seed: int, bootstrap: int
+    item_ids: list[str],
+    comparisons: list[dict],
+    seed: int,
+    bootstrap: int,
+    *,
+    fit_unseen: bool,
 ) -> tuple[list[dict], list[str]]:
-    """rows: {"rank", "id", "utility", "rank_ci", "n_comparisons"}; plus zero-comparison ids."""
-    strengths = fit_bt(item_ids, comparisons)
-
+    """rows: {"rank", "id", "utility", "rank_ci", "n_comparisons"} for the fitted
+    items; zero_ids is always the ids with zero comparisons, which are excluded
+    from the fit when fit_unseen=False and fitted at the prior when True."""
     cmps_count = {k: 0 for k in item_ids}
     for c in comparisons:
         cmps_count[c["a"]] += 1
         cmps_count[c["b"]] += 1
 
-    rng = random.Random(seed)
-    ci = bootstrap_ranks(item_ids, comparisons, bootstrap, rng)
+    zero_ids = [k for k in item_ids if cmps_count[k] == 0]
+    fit_ids = item_ids if fit_unseen else [k for k in item_ids if cmps_count[k] > 0]
+    if not fit_ids:
+        return [], zero_ids
 
-    order = sorted(range(len(item_ids)), key=lambda i: (-strengths[item_ids[i]], i))
+    strengths = fit_bt(fit_ids, comparisons)
+
+    rng = random.Random(seed)
+    ci = bootstrap_ranks(fit_ids, comparisons, bootstrap, rng)
+
+    order = sorted(range(len(fit_ids)), key=lambda i: (-strengths[fit_ids[i]], i))
 
     ranking = []
     for rank, i in enumerate(order, start=1):
-        kid = item_ids[i]
+        kid = fit_ids[i]
         rc = ci.get(kid)
         ranking.append(
             {
@@ -639,12 +651,15 @@ def _fit_ranking(
             }
         )
 
-    zero_ids = [k for k in item_ids if cmps_count[k] == 0]
     return ranking, zero_ids
 
 
-def _build_ranking(state: dict, bootstrap: int) -> tuple[list[dict], list[str]]:
-    ranking, zero_keys = _fit_ranking(CANON_IDS, state["comparisons"], state["seed"], bootstrap)
+def _build_ranking(
+    state: dict, bootstrap: int, *, fit_unseen: bool
+) -> tuple[list[dict], list[str]]:
+    ranking, zero_keys = _fit_ranking(
+        CANON_IDS, state["comparisons"], state["seed"], bootstrap, fit_unseen=fit_unseen
+    )
     for row in ranking:
         key = KEYS_BY_ID[row["id"]]
         row["row"] = key.row
@@ -653,9 +668,15 @@ def _build_ranking(state: dict, bootstrap: int) -> tuple[list[dict], list[str]]:
     return ranking, zero_keys
 
 
-def _build_bigram_ranking(state: dict, bootstrap: int) -> tuple[list[dict], list[str]]:
+def _build_bigram_ranking(
+    state: dict, bootstrap: int, *, fit_unseen: bool
+) -> tuple[list[dict], list[str]]:
     ranking, zero_ids = _fit_ranking(
-        bigram_universe(state), state["comparisons"], state["seed"], bootstrap
+        bigram_universe(state),
+        state["comparisons"],
+        state["seed"],
+        bootstrap,
+        fit_unseen=fit_unseen,
     )
     for row in ranking:
         first, second = split_bigram(row["id"])
@@ -672,13 +693,21 @@ def _build_bigram_ranking(state: dict, bootstrap: int) -> tuple[list[dict], list
 
 
 def _print_anchor_summary(
-    state: dict, anchors: list[str], universe: list[str], bootstrap: int
+    state: dict,
+    anchors: list[str],
+    universe: list[str],
+    bootstrap: int,
+    *,
+    fit_unseen: bool,
 ) -> None:
-    ranking, _ = _fit_ranking(universe, state["comparisons"], state["seed"], bootstrap)
+    ranking, _ = _fit_ranking(
+        universe, state["comparisons"], state["seed"], bootstrap, fit_unseen=fit_unseen
+    )
     by_id = {row["id"]: row for row in ranking}
-    rows = sorted((by_id[a] for a in anchors), key=lambda r: r["rank"])
+    missing = [a for a in anchors if a not in by_id]
+    rows = sorted((by_id[a] for a in anchors if a in by_id), key=lambda r: r["rank"])
     print()
-    print(f"{len(anchors)} anchored items, ranked against all {len(universe)}:")
+    print(f"{len(rows)} anchored items, ranked against {len(ranking)} of {len(universe)} items:")
     print(f"{'Rank':>4}  {'Item':<14}  {'Utility':>7}  {'Rank 95% CI':>12}   {'Cmps':>4}")
     for row in rows:
         ci = f"{row['rank_ci'][0]}-{row['rank_ci'][1]}" if row["rank_ci"] else "-"
@@ -686,39 +715,57 @@ def _print_anchor_summary(
             f"{row['rank']:>4}  {row['id']:<14}  {row['utility']:>+7.2f}  "
             f"{ci:>12}   {row['n_comparisons']:>4}"
         )
-    zero = [row["id"] for row in rows if row["n_comparisons"] == 0]
-    if zero:
-        print("anchored items with zero comparisons: " + ", ".join(zero), file=sys.stderr)
+    if fit_unseen:
+        zero = [row["id"] for row in rows if row["n_comparisons"] == 0]
+        if zero:
+            print(
+                "anchored items with zero comparisons (fitted at the prior): " + ", ".join(zero),
+                file=sys.stderr,
+            )
+    elif missing:
+        print("anchored items excluded (zero comparisons): " + ", ".join(missing), file=sys.stderr)
 
 
-def _print_report(state: dict, bootstrap: int, json_output: bool) -> None:
+def _print_report(state: dict, bootstrap: int, json_output: bool, *, fit_unseen: bool) -> None:
     comparisons = state["comparisons"]
-    ranking, zero_keys = _build_ranking(state, bootstrap)
+    ranking, zero_keys = _build_ranking(state, bootstrap, fit_unseen=fit_unseen)
 
-    if len(comparisons) < 2 * N_POS:
+    if len(comparisons) < 2 * len(ranking):
         print(
-            f"only {len(comparisons)} comparisons for {N_POS} mirror positions; "
+            f"only {len(comparisons)} comparisons for {len(ranking)} mirror positions; "
             "ranking is weak - run 'kbrank ask' for more",
             file=sys.stderr,
         )
     if zero_keys:
-        print(
-            "positions with zero comparisons: " + ", ".join(zero_keys),
-            file=sys.stderr,
-        )
+        if fit_unseen:
+            print(
+                "positions with zero comparisons (fitted at the prior): " + ", ".join(zero_keys),
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"excluded {len(zero_keys)} of {N_POS} positions with zero comparisons: "
+                + ", ".join(zero_keys),
+                file=sys.stderr,
+            )
 
     if json_output:
         out = {
             "n_positions": N_POS,
+            "n_ranked": len(ranking),
             "n_comparisons": len(comparisons),
             "grid": [ROWS, COLS],
             "symmetric": True,
+            "fit_unseen": fit_unseen,
             "ranking": ranking,
         }
         print(json.dumps(out))
         return
 
-    print(f"{N_POS} mirror positions (left/right halves treated as identical), {len(comparisons)} comparisons")
+    print(
+        f"{N_POS} mirror positions (left/right halves treated as identical), "
+        f"{len(comparisons)} comparisons, {len(ranking)} positions ranked"
+    )
     print(
         "Utility values are log-strengths from a Bradley-Terry fit; "
         "only their ORDER is meaningful."
@@ -739,35 +786,54 @@ def _print_report(state: dict, bootstrap: int, json_output: bool) -> None:
     print()
     print("Rank map (1 = most preferred):")
     print("(mirrored: both halves share one rank)")
+    if zero_keys and not fit_unseen:
+        print("('-' = excluded: zero comparisons)")
     rank_by_key = {row["id"]: row["rank"] for row in ranking}
-    print("\n".join(_grid_lines(lambda key: str(rank_by_key[canonical_id(key.id)]))))
+    print(
+        "\n".join(
+            _grid_lines(
+                lambda key: str(rank_by_key.get(canonical_id(key.id), "-"))
+            )
+        )
+    )
 
 
-def _print_bigram_report(state: dict, bootstrap: int, json_output: bool, top: int) -> None:
+def _print_bigram_report(
+    state: dict, bootstrap: int, json_output: bool, top: int, *, fit_unseen: bool
+) -> None:
     comparisons = state["comparisons"]
-    ranking, zero_ids = _build_bigram_ranking(state, bootstrap)
+    ranking, zero_ids = _build_bigram_ranking(state, bootstrap, fit_unseen=fit_unseen)
     universe = bigram_universe(state)
     n_items = len(universe)
 
-    if len(comparisons) < 2 * n_items:
+    if len(comparisons) < 2 * len(ranking):
         print(
-            f"only {len(comparisons)} comparisons for {n_items} sequences; "
+            f"only {len(comparisons)} comparisons for {len(ranking)} sequences; "
             "ranking is weak - run 'kbrank ask --mode bigrams' for more",
             file=sys.stderr,
         )
     if zero_ids:
-        print(
-            f"{len(zero_ids)} of {n_items} sequences have zero comparisons",
-            file=sys.stderr,
-        )
+        if fit_unseen:
+            print(
+                f"{len(zero_ids)} of {n_items} sequences have zero comparisons "
+                "(fitted at the prior)",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"excluded {len(zero_ids)} of {n_items} sequences with zero comparisons",
+                file=sys.stderr,
+            )
 
     if json_output:
         out = {
             "mode": "bigrams",
             "n_items": n_items,
+            "n_ranked": len(ranking),
             "n_comparisons": len(comparisons),
             "grid": [ROWS, COLS],
             "symmetric": True,
+            "fit_unseen": fit_unseen,
             "crosshand": state["crosshand"],
             "ranking": ranking,
         }
@@ -781,7 +847,7 @@ def _print_bigram_report(state: dict, bootstrap: int, json_output: bool, top: in
     )
     print(
         f"{n_items} two-key sequences over {N_POS} mirror positions ({scope}, repeats included), "
-        f"{len(comparisons)} comparisons"
+        f"{len(comparisons)} comparisons, {len(ranking)} sequences ranked"
     )
     print(
         "Utility values are log-strengths from a Bradley-Terry fit; "
@@ -813,7 +879,9 @@ def _print_bigram_report(state: dict, bootstrap: int, json_output: bool, top: in
             print(_row_line(row))
 
 
-def _print_bigram_compare(state: dict, bootstrap: int, specs: list[str]) -> None:
+def _print_bigram_compare(
+    state: dict, bootstrap: int, specs: list[str], *, fit_unseen: bool
+) -> None:
     left, right = (parse_bigram(s) for s in specs)
     universe = bigram_universe(state)
     for seq in (left, right):
@@ -824,18 +892,29 @@ def _print_bigram_compare(state: dict, bootstrap: int, specs: list[str]) -> None
                 file=sys.stderr,
             )
             sys.exit(2)
-    ranking, _ = _build_bigram_ranking(state, bootstrap)
+    ranking, _ = _build_bigram_ranking(state, bootstrap, fit_unseen=fit_unseen)
     by_id = {row["id"]: row for row in ranking}
+
+    for seq in (left, right):
+        if seq not in by_id:
+            print(
+                f"{seq} has no recorded comparisons; pass --fit-unseen to score it at the prior",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    if fit_unseen:
+        for seq in (left, right):
+            if by_id[seq]["n_comparisons"] == 0:
+                print(
+                    f"warning: {seq} has no recorded comparisons; its utility is the prior",
+                    file=sys.stderr,
+                )
 
     def _stat_line(seq: str) -> str:
         row = by_id[seq]
-        if row["n_comparisons"] == 0:
-            print(
-                f"warning: {seq} has no recorded comparisons; its utility is the prior",
-                file=sys.stderr,
-            )
         return (
-            f"{seq:<10}  rank {row['rank']:>3}/{len(universe)}   "
+            f"{seq:<10}  rank {row['rank']:>3}/{len(ranking)}   "
             f"utility {row['utility']:>+6.2f}   cmps {row['n_comparisons']:>4}"
         )
 
@@ -993,7 +1072,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
             target = args.n if args.n is not None else N_PAIRS
             _run_ask_session(state, path, target, mode)
             if len(state["comparisons"]) >= target:
-                _print_report(state, bootstrap=200, json_output=False)
+                _print_report(state, bootstrap=200, json_output=False, fit_unseen=False)
         else:
             n = args.n if args.n is not None else _anchored_pair_count(len(only), N_POS)
             if n <= 0:
@@ -1003,7 +1082,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
             print(f"--only: {len(only)} of {N_POS} items anchored, {n} pairs this run")
             _run_ask_session(state, path, target, mode, undo_floor=len(state["comparisons"]))
             if len(state["comparisons"]) >= target:
-                _print_anchor_summary(state, only, CANON_IDS, BOOTSTRAP_DEFAULTS[args.mode])
+                _print_anchor_summary(
+                    state, only, CANON_IDS, BOOTSTRAP_DEFAULTS[args.mode], fit_unseen=False
+                )
         return 0
 
     state = load_bigram_state(path, seed=args.seed)
@@ -1031,7 +1112,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
         )
         _run_ask_session(state, path, target, mode)
         if len(state["comparisons"]) >= target:
-            _print_bigram_report(state, bootstrap=50, json_output=False, top=20)
+            _print_bigram_report(state, bootstrap=50, json_output=False, top=20, fit_unseen=False)
     else:
         n = args.n if args.n is not None else min(
             BIGRAM_SESSION_QUESTIONS, _anchored_pair_count(len(only), len(universe))
@@ -1043,7 +1124,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
         print(f"--only: {len(only)} of {len(universe)} items anchored, {n} pairs this run")
         _run_ask_session(state, path, target, mode, undo_floor=len(state["comparisons"]))
         if len(state["comparisons"]) >= target:
-            _print_anchor_summary(state, only, universe, BOOTSTRAP_DEFAULTS[args.mode])
+            _print_anchor_summary(
+                state, only, universe, BOOTSTRAP_DEFAULTS[args.mode], fit_unseen=False
+            )
     return 0
 
 
@@ -1064,7 +1147,9 @@ def cmd_report(args: argparse.Namespace) -> int:
         if not state["comparisons"]:
             print(f"no comparisons recorded in {path}", file=sys.stderr)
             return 1
-        _print_report(state, bootstrap=bootstrap, json_output=args.json)
+        _print_report(
+            state, bootstrap=bootstrap, json_output=args.json, fit_unseen=args.fit_unseen
+        )
         return 0
 
     state = load_bigram_state(path)
@@ -1072,9 +1157,17 @@ def cmd_report(args: argparse.Namespace) -> int:
         print(f"no comparisons recorded in {path}", file=sys.stderr)
         return 1
     if args.compare:
-        _print_bigram_compare(state, bootstrap=0, specs=args.compare)
+        _print_bigram_compare(
+            state, bootstrap=0, specs=args.compare, fit_unseen=args.fit_unseen
+        )
     else:
-        _print_bigram_report(state, bootstrap=bootstrap, json_output=args.json, top=args.top)
+        _print_bigram_report(
+            state,
+            bootstrap=bootstrap,
+            json_output=args.json,
+            top=args.top,
+            fit_unseen=args.fit_unseen,
+        )
     return 0
 
 
@@ -1166,6 +1259,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report_p.add_argument(
         "--top", type=int, default=20, help="number of top-ranked items to print"
+    )
+    report_p.add_argument(
+        "--fit-unseen",
+        action="store_true",
+        help="also fit items that appear in no comparison; they land on the prior "
+             "(log-strength 0) and are ranked alongside the rest. Off by default: "
+             "only items backed by real comparisons are ranked.",
     )
     report_p.add_argument(
         "--compare",

@@ -171,7 +171,7 @@ class SymmetryTests(unittest.TestCase):
         }
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            kbrank._print_report(state, bootstrap=0, json_output=False)
+            kbrank._print_report(state, bootstrap=0, json_output=False, fit_unseen=False)
         output = buf.getvalue()
         grid_lines = output.strip("\n").split("\n")[-3:]
         for line in grid_lines:
@@ -609,12 +609,67 @@ class OnlyFilterTests(unittest.TestCase):
         state = {"version": 2, "grid": [3, 10], "seed": 1, "comparisons": comparisons}
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            kbrank._print_anchor_summary(state, ["r1c5"], kbrank.CANON_IDS, 0)
+            kbrank._print_anchor_summary(
+                state, ["r1c5"], kbrank.CANON_IDS, 0, fit_unseen=False
+            )
         text = out.getvalue()
-        self.assertIn("1 anchored items, ranked against all 15:", text)
-        ranking, _ = kbrank._fit_ranking(kbrank.CANON_IDS, comparisons, state["seed"], 0)
+        self.assertIn("1 anchored items, ranked against 15 of 15 items:", text)
+        ranking, _ = kbrank._fit_ranking(
+            kbrank.CANON_IDS, comparisons, state["seed"], 0, fit_unseen=False
+        )
         expected_rank = next(row["rank"] for row in ranking if row["id"] == "r1c5")
         self.assertIn(f"{expected_rank:>4}  r1c5", text)
+
+    def _keys_state_partial_comparisons(self):
+        seen = ["r1c1", "r1c2", "r1c3"]
+        comparisons = [
+            {"a": a, "b": b, "result": "a"} for a, b in itertools.combinations(seen, 2)
+        ]
+        return {
+            "version": 2,
+            "grid": [3, 10],
+            "symmetric": True,
+            "seed": 1,
+            "comparisons": comparisons,
+        }
+
+    def test_report_excludes_unseen_by_default(self):
+        state = self._keys_state_partial_comparisons()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            kbrank._print_report(state, bootstrap=0, json_output=True, fit_unseen=False)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["n_positions"], 15)
+        self.assertEqual(report["n_ranked"], 3)
+        self.assertEqual({row["id"] for row in report["ranking"]}, {"r1c1", "r1c2", "r1c3"})
+        self.assertEqual(sorted(row["rank"] for row in report["ranking"]), [1, 2, 3])
+
+    def test_fit_unseen_ranks_full_universe(self):
+        state = self._keys_state_partial_comparisons()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            kbrank._print_report(state, bootstrap=0, json_output=True, fit_unseen=True)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["n_ranked"], 15)
+        unseen_rows = [row for row in report["ranking"] if row["id"] not in ("r1c1", "r1c2", "r1c3")]
+        self.assertEqual(len(unseen_rows), 12)
+        self.assertTrue(all(row["n_comparisons"] == 0 for row in unseen_rows))
+        utilities = {row["utility"] for row in unseen_rows}
+        self.assertEqual(utilities, {0.0})
+
+    def test_rank_map_marks_excluded_positions(self):
+        state = self._keys_state_partial_comparisons()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            kbrank._print_report(state, bootstrap=0, json_output=False, fit_unseen=False)
+        output = out.getvalue()
+        grid_lines = output.strip("\n").split("\n")[-3:]
+        found_dash = False
+        for line in grid_lines:
+            cells = line.split()[1:]
+            self.assertEqual(cells[:5], list(reversed(cells[5:])))
+            found_dash = found_dash or "-" in cells
+        self.assertTrue(found_dash)
 
 
 if __name__ == "__main__":
