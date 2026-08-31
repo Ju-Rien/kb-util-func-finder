@@ -118,16 +118,21 @@ _RC_RE = re.compile(r"r(\d+)c(\d+)", re.IGNORECASE)
 _TUPLE_RE = re.compile(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)")
 
 
-def parse_bigram(spec: str) -> str:
+def _parse_coords(spec: str) -> list[str] | None:
+    """Canonical mirror ids for every coordinate in `spec`; None if one is off-grid."""
     found = _RC_RE.findall(spec) or _TUPLE_RE.findall(spec)
     ids = []
     for r, c in found:
         r, c = int(r), int(c)
         if not (1 <= r <= ROWS and 1 <= c <= COLS):
-            found = []
-            break
+            return None
         ids.append(canonical_id(f"r{r}c{c}"))
-    if len(found) != 2:
+    return ids
+
+
+def parse_bigram(spec: str) -> str:
+    ids = _parse_coords(spec)
+    if ids is None or len(ids) != 2:
         print(
             f"cannot parse sequence {spec!r}; use 'r2c1>r2c2' or '(2,1)-(2,2)' "
             f"with row 1-{ROWS}, col 1-{COLS}",
@@ -135,6 +140,51 @@ def parse_bigram(spec: str) -> str:
         )
         sys.exit(2)
     return f"{ids[0]}{BIGRAM_SEP}{ids[1]}"
+
+
+def parse_only(specs: list[str], mode: str) -> list[str]:
+    """Expand `--only` tokens into the anchor list, in canonical order.
+
+    A token with one coordinate is a key ('r2c1', '(2,1)'); a token with two is a
+    sequence ('r2c1-r2c2', 'r2c1>r2c2', '(2,1)-(2,2)'). In keys mode the result is the
+    given keys; in bigrams mode it is every ordered pair over the given keys (repeats
+    included) plus every explicitly named sequence. A single anchor is valid: it is
+    compared against the rest of the space.
+    """
+    keys: list[str] = []
+    seqs: list[str] = []
+    for spec in specs:
+        ids = _parse_coords(spec)
+        if not ids or len(ids) > 2:
+            print(
+                f"cannot parse --only entry {spec!r}; use 'r2c1' for a key or "
+                f"'r2c1-r2c2' for a sequence, with row 1-{ROWS}, col 1-{COLS}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if len(ids) == 1:
+            keys.append(ids[0])
+        elif mode == "keys":
+            print(
+                f"--only entry {spec!r} is a sequence; sequences require --mode bigrams",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        else:
+            seqs.append(f"{ids[0]}{BIGRAM_SEP}{ids[1]}")
+
+    if mode == "keys":
+        items = set(keys)
+        universe = CANON_IDS
+    else:
+        items = {f"{a}{BIGRAM_SEP}{b}" for a in keys for b in keys} | set(seqs)
+        universe = BIGRAM_IDS
+
+    ordered = [i for i in universe if i in items]
+    if not ordered:
+        print("--only must select at least 1 item", file=sys.stderr)
+        sys.exit(2)
+    return ordered
 
 
 def render_sequence_grid(bigram_id: str, upper: str, lower: str) -> str:
@@ -425,11 +475,14 @@ class PairSampler:
 
 class BalancedPairSampler:
     """Always compares the two least-compared items, so coverage stays even over a
-    space too large to exhaust. Pure function of (seed, comparison history), so resume
-    and undo are deterministic without persisting a cursor."""
+    space too large to exhaust. With `anchors`, the first side is always drawn from
+    that subset and the opponent from the full item list. Pure function of
+    (seed, comparison history), so resume and undo are deterministic without
+    persisting a cursor."""
 
-    def __init__(self, item_ids: list[str], seed: int):
+    def __init__(self, item_ids: list[str], seed: int, anchors: list[str] | None = None):
         self.items = list(item_ids)
+        self.anchors = list(anchors) if anchors is not None else self.items
         rng = random.Random(seed)
         order = list(range(len(self.items)))
         rng.shuffle(order)
@@ -443,7 +496,7 @@ class BalancedPairSampler:
             counts[c["b"]] += 1
             seen.add(frozenset((c["a"], c["b"])))
         tb = self.tiebreak
-        a = min(self.items, key=lambda k: (counts[k], tb[k]))
+        a = min(self.anchors, key=lambda k: (counts[k], tb[k]))
         b = min(
             (k for k in self.items if k != a),
             key=lambda k: (frozenset((a, k)) in seen, counts[k], tb[k]),
@@ -513,6 +566,26 @@ def _build_bigram_ranking(state: dict, bootstrap: int) -> tuple[list[dict], list
                 "mirror_col": mirror_col(key.col),
             }
     return ranking, zero_ids
+
+
+def _print_anchor_summary(
+    state: dict, anchors: list[str], universe: list[str], bootstrap: int
+) -> None:
+    ranking, _ = _fit_ranking(universe, state["comparisons"], state["seed"], bootstrap)
+    by_id = {row["id"]: row for row in ranking}
+    rows = sorted((by_id[a] for a in anchors), key=lambda r: r["rank"])
+    print()
+    print(f"{len(anchors)} anchored items, ranked against all {len(universe)}:")
+    print(f"{'Rank':>4}  {'Item':<14}  {'Utility':>7}  {'Rank 95% CI':>12}   {'Cmps':>4}")
+    for row in rows:
+        ci = f"{row['rank_ci'][0]}-{row['rank_ci'][1]}" if row["rank_ci"] else "-"
+        print(
+            f"{row['rank']:>4}  {row['id']:<14}  {row['utility']:>+7.2f}  "
+            f"{ci:>12}   {row['n_comparisons']:>4}"
+        )
+    zero = [row["id"] for row in rows if row["n_comparisons"] == 0]
+    if zero:
+        print("anchored items with zero comparisons: " + ", ".join(zero), file=sys.stderr)
 
 
 def _print_report(state: dict, bootstrap: int, json_output: bool) -> None:
@@ -683,7 +756,19 @@ class AskMode:
     options: Callable[[str, str], str]             # (id1, id2) -> the two option lines
 
 
-def _run_ask_session(state: dict, path: str, target: int, mode: AskMode) -> int:
+def _anchored_pair_count(n_anchors: int, n_universe: int) -> int:
+    """Unordered pairs over `n_universe` items that include one of `n_anchors`."""
+    rest = n_universe - n_anchors
+    return n_universe * (n_universe - 1) // 2 - rest * (rest - 1) // 2
+
+
+def _history_swap(state: dict) -> bool:
+    return random.Random(f"{state['seed']}:{len(state['comparisons'])}").random() < 0.5
+
+
+def _run_ask_session(
+    state: dict, path: str, target: int, mode: AskMode, undo_floor: int = 0
+) -> int:
     current: tuple[str, str] | None = None
 
     while len(state["comparisons"]) < target:
@@ -724,7 +809,7 @@ def _run_ask_session(state: dict, path: str, target: int, mode: AskMode) -> int:
             save_state(path, state)
             current = None
         elif raw == "u":
-            if state["comparisons"]:
+            if len(state["comparisons"]) > undo_floor:
                 popped = state["comparisons"].pop()
                 save_state(path, state)
                 current = (popped["a"], popped["b"])
@@ -744,10 +829,18 @@ def _run_ask_session(state: dict, path: str, target: int, mode: AskMode) -> int:
 
 def cmd_ask(args: argparse.Namespace) -> int:
     path = args.state or STATE_DEFAULTS[args.mode]
+    only = parse_only(args.only, args.mode) if args.only else None
 
     if args.mode == "keys":
         state = load_state(path, seed=args.seed)
-        sampler = PairSampler(state["seed"], len(state["comparisons"]) % N_PAIRS)
+        if only is None:
+            sampler = PairSampler(state["seed"], len(state["comparisons"]) % N_PAIRS)
+            next_pair = lambda s: sampler.next_pair()
+            swap = lambda s: sampler.presentation_swap()
+        else:
+            sampler = BalancedPairSampler(CANON_IDS, state["seed"], anchors=only)
+            next_pair = lambda s: sampler.next_pair(s["comparisons"])
+            swap = _history_swap
 
         def _options(id1: str, id2: str) -> str:
             k1, k2 = KEYS_BY_ID[id1], KEYS_BY_ID[id2]
@@ -757,8 +850,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
             )
 
         mode = AskMode(
-            next_pair=lambda s: sampler.next_pair(),
-            swap=lambda s: sampler.presentation_swap(),
+            next_pair=next_pair,
+            swap=swap,
             render=lambda id1, id2: (
                 render_grid(id1, id2)
                 + "\nMirror cells (a)/[b] are the same position on the other hand."
@@ -766,29 +859,53 @@ def cmd_ask(args: argparse.Namespace) -> int:
             question="Which key position is more comfortable to type?",
             options=_options,
         )
-        target = args.n if args.n is not None else N_PAIRS
-        _run_ask_session(state, path, target, mode)
-        if len(state["comparisons"]) >= target:
-            _print_report(state, bootstrap=200, json_output=False)
+        if only is None:
+            target = args.n if args.n is not None else N_PAIRS
+            _run_ask_session(state, path, target, mode)
+            if len(state["comparisons"]) >= target:
+                _print_report(state, bootstrap=200, json_output=False)
+        else:
+            n = args.n if args.n is not None else _anchored_pair_count(len(only), N_POS)
+            if n <= 0:
+                print("-n must be positive", file=sys.stderr)
+                return 2
+            target = len(state["comparisons"]) + n
+            print(f"--only: {len(only)} of {N_POS} items anchored, {n} pairs this run")
+            _run_ask_session(state, path, target, mode, undo_floor=len(state["comparisons"]))
+            if len(state["comparisons"]) >= target:
+                _print_anchor_summary(state, only, CANON_IDS, BOOTSTRAP_DEFAULTS[args.mode])
         return 0
 
     state = load_bigram_state(path, seed=args.seed)
-    sampler = BalancedPairSampler(BIGRAM_IDS, state["seed"])
+    sampler = BalancedPairSampler(BIGRAM_IDS, state["seed"], anchors=only)
     mode = AskMode(
         next_pair=lambda s: sampler.next_pair(s["comparisons"]),
-        swap=lambda s: random.Random(f"{s['seed']}:{len(s['comparisons'])}").random() < 0.5,
+        swap=_history_swap,
         render=render_bigram_pair,
         question="Which two-key sequence is more comfortable to type in order?",
         options=lambda id1, id2: (
             f"  1) A: {describe_bigram(id1)}\n  2) B: {describe_bigram(id2)}"
         ),
     )
-    target = (
-        args.n if args.n is not None else len(state["comparisons"]) + BIGRAM_SESSION_QUESTIONS
-    )
-    _run_ask_session(state, path, target, mode)
-    if len(state["comparisons"]) >= target:
-        _print_bigram_report(state, bootstrap=50, json_output=False, top=20)
+    if only is None:
+        target = (
+            args.n if args.n is not None else len(state["comparisons"]) + BIGRAM_SESSION_QUESTIONS
+        )
+        _run_ask_session(state, path, target, mode)
+        if len(state["comparisons"]) >= target:
+            _print_bigram_report(state, bootstrap=50, json_output=False, top=20)
+    else:
+        n = args.n if args.n is not None else min(
+            BIGRAM_SESSION_QUESTIONS, _anchored_pair_count(len(only), N_BIGRAMS)
+        )
+        if n <= 0:
+            print("-n must be positive", file=sys.stderr)
+            return 2
+        target = len(state["comparisons"]) + n
+        print(f"--only: {len(only)} of {N_BIGRAMS} items anchored, {n} pairs this run")
+        _run_ask_session(state, path, target, mode, undo_floor=len(state["comparisons"]))
+        if len(state["comparisons"]) >= target:
+            _print_anchor_summary(state, only, BIGRAM_IDS, BOOTSTRAP_DEFAULTS[args.mode])
     return 0
 
 
@@ -837,6 +954,17 @@ def build_parser() -> argparse.ArgumentParser:
     ask_p.add_argument("--state", default=None)
     ask_p.add_argument("-n", type=int, default=None)
     ask_p.add_argument("--seed", type=int, default=None)
+    ask_p.add_argument(
+        "--only",
+        action="extend",
+        nargs="+",
+        default=None,
+        metavar="SPEC",
+        help="anchor prompting to these keys/sequences: every prompted pair includes "
+             "one of them, the opponent ranges over the full space. 'r2c1' selects a "
+             "key, 'r2c1-r2c2' a sequence (bigrams mode only). Whitespace-separated, "
+             "flag repeatable. Prefer '-' over '>' to avoid shell redirection.",
+    )
     ask_p.set_defaults(func=cmd_ask)
 
     report_p = sub.add_parser("report", help="print the recovered rank table")

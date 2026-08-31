@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import itertools
 import json
 import math
@@ -8,6 +10,7 @@ import random
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -309,6 +312,183 @@ class SparseFitTests(unittest.TestCase):
         d2 = sum((fitted_rank[k] - true_rank[k]) ** 2 for k in kbrank.BIGRAM_IDS)
         spearman = 1 - (6 * d2) / (n * (n**2 - 1))
         self.assertGreater(spearman, 0.9)
+
+
+class OnlyFilterTests(unittest.TestCase):
+    def test_parse_only_keys_mirror_folding_and_order(self):
+        self.assertEqual(kbrank.parse_only(["r1c8", "r2c1"], "keys"), ["r1c3", "r2c1"])
+
+    def test_parse_only_bigrams_expands_keys_to_all_ordered_pairs(self):
+        self.assertEqual(
+            kbrank.parse_only(["r1c1", "r1c2"], "bigrams"),
+            ["r1c1>r1c1", "r1c1>r1c2", "r1c2>r1c1", "r1c2>r1c2"],
+        )
+
+    def test_parse_only_bigrams_mixes_keys_and_explicit_sequence(self):
+        result = kbrank.parse_only(["r1c1", "(2,1)-(2,2)"], "bigrams")
+        self.assertIn("r2c1>r2c2", result)
+        self.assertIn("r1c1>r1c1", result)
+        self.assertEqual(len(result), 2)
+
+    def test_parse_only_rejects_bad_input(self):
+        with self.assertRaises(SystemExit) as ctx:
+            kbrank.parse_only(["r1c1-r1c2"], "keys")
+        self.assertEqual(ctx.exception.code, 2)
+        with self.assertRaises(SystemExit) as ctx:
+            kbrank.parse_only(["r9c9"], "keys")
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_parse_only_single_anchor_allowed(self):
+        self.assertEqual(kbrank.parse_only(["r1c5"], "keys"), ["r1c5"])
+        self.assertEqual(kbrank.parse_only(["r1c1"], "bigrams"), ["r1c1>r1c1"])
+
+    def test_anchored_pair_count(self):
+        self.assertEqual(kbrank._anchored_pair_count(1, 15), 14)
+        self.assertEqual(kbrank._anchored_pair_count(2, 15), 27)
+        self.assertEqual(kbrank._anchored_pair_count(15, 15), 105)
+        self.assertEqual(kbrank._anchored_pair_count(1, 225), 224)
+
+    def test_ask_bigrams_end_to_end_filtered(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "bigram.json")
+            with mock.patch("builtins.input", side_effect=["1"] * 6):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    kbrank.main(
+                        [
+                            "ask",
+                            "--mode",
+                            "bigrams",
+                            "--state",
+                            path,
+                            "--only",
+                            "r1c1",
+                            "r1c2",
+                            "-n",
+                            "6",
+                        ]
+                    )
+            state = kbrank.load_bigram_state(path)
+            self.assertEqual(len(state["comparisons"]), 6)
+            anchors = set(kbrank.parse_only(["r1c1", "r1c2"], "bigrams"))
+            outside = False
+            for c in state["comparisons"]:
+                self.assertTrue({c["a"], c["b"]} & anchors)
+                if {c["a"], c["b"]} - anchors:
+                    outside = True
+            self.assertTrue(outside)
+            kbrank.load_bigram_state(path)
+
+    def test_ask_keys_end_to_end_filtered(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "keys.json")
+            with mock.patch("builtins.input", side_effect=["1"] * 27):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    kbrank.main(
+                        [
+                            "ask",
+                            "--mode",
+                            "keys",
+                            "--state",
+                            path,
+                            "--only",
+                            "r1c1",
+                            "r1c2",
+                        ]
+                    )
+            self.assertIn(
+                "--only: 2 of 15 items anchored, 27 pairs this run", out.getvalue()
+            )
+            state = kbrank.load_state(path)
+            self.assertEqual(len(state["comparisons"]), 27)
+            anchors = {"r1c1", "r1c2"}
+            outside = False
+            for c in state["comparisons"]:
+                self.assertTrue({c["a"], c["b"]} & anchors)
+                if {c["a"], c["b"]} - anchors:
+                    outside = True
+            self.assertTrue(outside)
+            kbrank.load_state(path)
+
+    def test_ask_only_n_is_additive_over_existing_history(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "keys.json")
+            state = {
+                "version": 2,
+                "grid": [3, 10],
+                "seed": 1,
+                "comparisons": [
+                    {"a": "r1c1", "b": "r1c2", "result": "a", "t": 1.0} for _ in range(105)
+                ],
+            }
+            kbrank.save_state(path, state)
+            with mock.patch("builtins.input", side_effect=["1"] * 10):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    kbrank.main(
+                        [
+                            "ask",
+                            "--mode",
+                            "keys",
+                            "--state",
+                            path,
+                            "--only",
+                            "r1c5",
+                            "r3c5",
+                            "-n",
+                            "10",
+                        ]
+                    )
+            self.assertIn(
+                "--only: 2 of 15 items anchored, 10 pairs this run", out.getvalue()
+            )
+            reloaded = kbrank.load_state(path)
+            self.assertEqual(len(reloaded["comparisons"]), 115)
+            new_ones = reloaded["comparisons"][105:]
+            self.assertEqual(len(new_ones), 10)
+            for c in new_ones:
+                self.assertTrue({"r1c5", "r3c5"} & {c["a"], c["b"]})
+
+    def test_anchored_sampler_always_includes_an_anchor(self):
+        sampler = kbrank.BalancedPairSampler(kbrank.CANON_IDS, 7, anchors=["r1c5"])
+        comparisons = []
+        opponents = set()
+        for _ in range(14):
+            a, b = sampler.next_pair(comparisons)
+            self.assertIn("r1c5", (a, b))
+            opponent = b if a == "r1c5" else a
+            opponents.add(opponent)
+            comparisons.append({"a": a, "b": b, "result": "a"})
+        self.assertEqual(len(opponents), 14)
+        self.assertEqual(opponents, set(kbrank.CANON_IDS) - {"r1c5"})
+
+    def test_anchors_none_matches_unanchored(self):
+        sampler_explicit = kbrank.BalancedPairSampler(kbrank.BIGRAM_IDS, 7, anchors=None)
+        sampler_default = kbrank.BalancedPairSampler(kbrank.BIGRAM_IDS, 7)
+        comparisons_explicit = []
+        comparisons_default = []
+        for _ in range(20):
+            pair_e = sampler_explicit.next_pair(comparisons_explicit)
+            pair_d = sampler_default.next_pair(comparisons_default)
+            self.assertEqual(pair_e, pair_d)
+            comparisons_explicit.append({"a": pair_e[0], "b": pair_e[1], "result": "a"})
+            comparisons_default.append({"a": pair_d[0], "b": pair_d[1], "result": "a"})
+
+    def test_anchored_summary_reports_global_rank(self):
+        comparisons = [
+            {"a": "r1c5", "b": k, "result": "a", "t": 1.0}
+            for k in kbrank.CANON_IDS
+            if k != "r1c5"
+        ]
+        state = {"version": 2, "grid": [3, 10], "seed": 1, "comparisons": comparisons}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            kbrank._print_anchor_summary(state, ["r1c5"], kbrank.CANON_IDS, 0)
+        text = out.getvalue()
+        self.assertIn("1 anchored items, ranked against all 15:", text)
+        ranking, _ = kbrank._fit_ranking(kbrank.CANON_IDS, comparisons, state["seed"], 0)
+        expected_rank = next(row["rank"] for row in ranking if row["id"] == "r1c5")
+        self.assertIn(f"{expected_rank:>4}  r1c5", text)
 
 
 if __name__ == "__main__":
