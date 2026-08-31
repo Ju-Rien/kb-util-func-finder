@@ -93,21 +93,6 @@ class StateTests(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 2)
 
 
-class SamplerTests(unittest.TestCase):
-    def test_all_pairs_distinct(self):
-        sampler = kbrank.PairSampler(seed=7, skip=0)
-        pairs = [sampler.next_pair() for _ in range(kbrank.N_PAIRS)]
-        distinct = {frozenset(p) for p in pairs}
-        self.assertEqual(len(distinct), kbrank.N_PAIRS)
-
-    def test_skip_matches_direct_index(self):
-        skipped = kbrank.PairSampler(seed=7, skip=10)
-        fresh = kbrank.PairSampler(seed=7, skip=0)
-        for _ in range(11):
-            eleventh = fresh.next_pair()
-        self.assertEqual(skipped.next_pair(), eleventh)
-
-
 class GridRenderTests(unittest.TestCase):
     def test_render_grid(self):
         text = kbrank.render_grid("r1c4", "r3c2")

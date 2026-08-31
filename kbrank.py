@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import itertools
 import json
 import math
 import os
@@ -526,39 +525,6 @@ def bootstrap_ranks(
 # ----------------------------------------------------------------------------
 
 
-class PairSampler:
-    """Uniform-without-replacement sampler over the 105 unordered mirror-position pairs.
-
-    A fresh instance rebuilds and reshuffles the same seeded permutation every
-    time, so `skip` (the count of already-recorded comparisons modulo 105)
-    simply moves the read position forward without consuming randomness -
-    that is what makes resume deterministic and reproducible.
-    """
-
-    def __init__(self, seed: int, skip: int = 0):
-        self.seed = seed
-        self.epoch = 0
-        self.rng = random.Random(seed)
-        self._pairs = list(itertools.combinations(CANON_IDS, 2))
-        self.rng.shuffle(self._pairs)
-        self.pos = skip
-
-    def next_pair(self) -> tuple[str, str]:
-        if self.pos >= len(self._pairs):
-            self.epoch += 1
-            self.rng = random.Random(self.seed + self.epoch)
-            self._pairs = list(itertools.combinations(CANON_IDS, 2))
-            self.rng.shuffle(self._pairs)
-            self.pos = 0
-            print(f"all {N_PAIRS} pairs asked; sampling with repeats", file=sys.stderr)
-        pair = self._pairs[self.pos]
-        self.pos += 1
-        return pair
-
-    def presentation_swap(self) -> bool:
-        return self.rng.random() < 0.5
-
-
 class BalancedPairSampler:
     """Always compares the two least-compared items, so coverage stays even over a
     space too large to exhaust. With `anchors`, the first side is always drawn from
@@ -1042,14 +1008,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
     if args.mode == "keys":
         state = load_state(path, seed=args.seed)
-        if only is None:
-            sampler = PairSampler(state["seed"], len(state["comparisons"]) % N_PAIRS)
-            next_pair = lambda s: sampler.next_pair()
-            swap = lambda s: sampler.presentation_swap()
-        else:
-            sampler = BalancedPairSampler(CANON_IDS, state["seed"], anchors=only)
-            next_pair = lambda s: sampler.next_pair(s["comparisons"])
-            swap = _history_swap
+        sampler = BalancedPairSampler(CANON_IDS, state["seed"], anchors=only)
+        next_pair = lambda s: sampler.next_pair(s["comparisons"])
+        swap = _history_swap
 
         def _options(id1: str, id2: str) -> str:
             k1, k2 = KEYS_BY_ID[id1], KEYS_BY_ID[id2]
