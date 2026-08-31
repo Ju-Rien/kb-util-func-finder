@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import dataclasses
+import functools
 import json
 import math
 import os
@@ -525,6 +527,15 @@ def bootstrap_ranks(
 # ----------------------------------------------------------------------------
 
 
+SOFT_BIAS_ALPHA = 2.0   # item-count decay exponent; 0 -> uniform, large -> least-seen
+SOFT_PAIR_ALPHA = 6.0   # repeat-pair decay exponent, fixed, steeper than the item one
+
+
+def soft_weight(count: int, alpha: float) -> float:
+    """Power-law sampling weight: strictly decreasing in `count`, never zero."""
+    return (count + 1.0) ** -alpha
+
+
 class BalancedPairSampler:
     """Always compares the two least-compared items, so coverage stays even over a
     space too large to exhaust. With `anchors`, the first side is always drawn from
@@ -567,6 +578,95 @@ class BalancedPairSampler:
             candidates,
             key=lambda k: (frozenset((a, k)) in seen, counts[k], tb[k]),
         )
+        return a, b
+
+
+class UniformPairSampler:
+    """Uniform-random counterpart of `BalancedPairSampler` — each question is drawn
+    uniformly from the eligible unordered pairs, so no item or pair is favoured by
+    comparison counts or a tiebreak order. Already-asked pairs are excluded while any
+    unasked eligible pair remains. Like `BalancedPairSampler` it is a pure function of
+    (seed, comparison history), so resume and undo stay deterministic without
+    persisting a cursor."""
+
+    def __init__(
+        self,
+        item_ids: list[str],
+        seed: int,
+        anchors: list[str] | None = None,
+        compatible: Callable[[str, str], bool] | None = None,
+    ):
+        items = list(item_ids)
+        anchors = list(anchors) if anchors is not None else items
+        self.seed = seed
+        self.pairs: list[tuple[str, str]] = []
+        emitted: set[frozenset[str]] = set()
+        for a in anchors:
+            for b in items:
+                if b == a or (compatible is not None and not compatible(a, b)):
+                    continue
+                key = frozenset((a, b))
+                if key in emitted:
+                    continue
+                emitted.add(key)
+                self.pairs.append((a, b))
+        if not self.pairs:
+            raise ValueError("no eligible pairs to sample")
+
+    def next_pair(self, comparisons: list[dict]) -> tuple[str, str]:
+        seen = {frozenset((c["a"], c["b"])) for c in comparisons}
+        pool = [p for p in self.pairs if frozenset(p) not in seen] or self.pairs
+        rng = random.Random(f"{self.seed}:nobias:{len(comparisons)}")
+        return rng.choice(pool)
+
+
+class SoftBalancedPairSampler:
+    """Stochastically biased toward least-compared items: an item's draw weight is
+    `soft_weight(count, alpha)`, so P(seen once) > P(seen twice) >> P(seen 100x) > 0.
+    Repeat pairs are suppressed by the same power law at `SOFT_PAIR_ALPHA` rather than
+    excluded, so a pair can recur. Like the other samplers it is a pure function of
+    (seed, comparison history), so resume and undo stay deterministic without
+    persisting a cursor."""
+
+    def __init__(
+        self,
+        item_ids: list[str],
+        seed: int,
+        anchors: list[str] | None = None,
+        compatible: Callable[[str, str], bool] | None = None,
+        alpha: float = SOFT_BIAS_ALPHA,
+    ):
+        self.items = list(item_ids)
+        self.anchors = list(anchors) if anchors is not None else self.items
+        self.compatible = compatible
+        self.seed = seed
+        self.alpha = alpha
+
+    def next_pair(self, comparisons: list[dict]) -> tuple[str, str]:
+        counts: collections.Counter = collections.Counter()
+        pair_counts: collections.Counter = collections.Counter()
+        for c in comparisons:
+            counts[c["a"]] += 1
+            counts[c["b"]] += 1
+            pair_counts[frozenset((c["a"], c["b"]))] += 1
+        rng = random.Random(f"{self.seed}:softbias:{len(comparisons)}")
+        a = rng.choices(
+            self.anchors,
+            weights=[soft_weight(counts[k], self.alpha) for k in self.anchors],
+        )[0]
+        candidates = [
+            k
+            for k in self.items
+            if k != a and (self.compatible is None or self.compatible(a, k))
+        ]
+        if not candidates:
+            raise ValueError("no eligible pairs to sample")
+        weights = [
+            soft_weight(counts[k], self.alpha)
+            * soft_weight(pair_counts[frozenset((a, k))], SOFT_PAIR_ALPHA)
+            for k in candidates
+        ]
+        b = rng.choices(candidates, weights=weights)[0]
         return a, b
 
 
@@ -1005,10 +1105,21 @@ def cmd_ask(args: argparse.Namespace) -> int:
         if args.only
         else None
     )
+    if args.bias_alpha < 0:
+        print("--bias-alpha must be >= 0", file=sys.stderr)
+        return 2
+    if args.bias_alpha != SOFT_BIAS_ALPHA and not args.soft_bias:
+        print("note: --bias-alpha ignored without --soft-bias", file=sys.stderr)
+    if args.soft_bias:
+        make_sampler = functools.partial(SoftBalancedPairSampler, alpha=args.bias_alpha)
+    elif args.no_bias:
+        make_sampler = UniformPairSampler
+    else:
+        make_sampler = BalancedPairSampler
 
     if args.mode == "keys":
         state = load_state(path, seed=args.seed)
-        sampler = BalancedPairSampler(CANON_IDS, state["seed"], anchors=only)
+        sampler = make_sampler(CANON_IDS, state["seed"], anchors=only)
         next_pair = lambda s: sampler.next_pair(s["comparisons"])
         swap = _history_swap
 
@@ -1052,7 +1163,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
     if args.allow_crosshand:
         state["crosshand"] = True
     universe = bigram_universe(state)
-    sampler = BalancedPairSampler(
+    sampler = make_sampler(
         universe,
         state["seed"],
         anchors=only,
@@ -1178,6 +1289,32 @@ def build_parser() -> argparse.ArgumentParser:
              "one of them, the opponent ranges over the full space. 'r2c1' selects a "
              "key, 'r2c1-r2c2' a sequence (bigrams mode only). Whitespace-separated, "
              "flag repeatable. Prefer '-' over '>' to avoid shell redirection.",
+    )
+    sampler_g = ask_p.add_mutually_exclusive_group()
+    sampler_g.add_argument(
+        "--no-bias",
+        action="store_true",
+        help="draw each pair uniformly at random from the eligible pair space instead "
+             "of always comparing the two least-compared items; pairs already asked are "
+             "skipped until the space is exhausted. Works with --mode keys or bigrams, "
+             "with or without --only. Off by default (balanced sampling).",
+    )
+    sampler_g.add_argument(
+        "--soft-bias",
+        action="store_true",
+        help="draw each side at random with weight 1/(count+1)**alpha, so "
+             "under-sampled items are strongly favoured without being forced and every "
+             "item stays reachable; repeat pairs are suppressed, not forbidden. Sits "
+             "between the default balanced sweep and --no-bias. Works with --mode keys "
+             "or bigrams, with or without --only.",
+    )
+    ask_p.add_argument(
+        "--bias-alpha",
+        type=float,
+        default=SOFT_BIAS_ALPHA,
+        help=f"bias strength for --soft-bias (default {SOFT_BIAS_ALPHA}): 0 is uniform "
+             "over items, larger values approach the balanced sweep. Ignored without "
+             "--soft-bias.",
     )
     ask_p.add_argument(
         "--allow-crosshand",

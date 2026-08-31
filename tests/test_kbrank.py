@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import contextlib
 import io
 import itertools
@@ -321,6 +322,162 @@ class BalancedSamplerTests(unittest.TestCase):
         self.assertEqual(
             sampler.next_pair(comparisons), sampler.next_pair(comparisons)
         )
+
+
+class UniformSamplerTests(unittest.TestCase):
+    def test_no_dupe_pairs_and_differs_from_balanced(self):
+        uniform = kbrank.UniformPairSampler(kbrank.BIGRAM_IDS, seed=7)
+        uniform_comparisons = []
+        uniform_pairs = []
+        seen = set()
+        for _ in range(200):
+            a, b = uniform.next_pair(uniform_comparisons)
+            seen.add(frozenset((a, b)))
+            uniform_pairs.append((a, b))
+            uniform_comparisons.append({"a": a, "b": b, "result": "a"})
+        self.assertEqual(len(seen), 200)
+
+        balanced = kbrank.BalancedPairSampler(kbrank.BIGRAM_IDS, seed=7)
+        balanced_comparisons = []
+        balanced_pairs = []
+        for _ in range(200):
+            a, b = balanced.next_pair(balanced_comparisons)
+            balanced_pairs.append((a, b))
+            balanced_comparisons.append({"a": a, "b": b, "result": "a"})
+        self.assertNotEqual(uniform_pairs, balanced_pairs)
+
+    def test_deterministic_given_history(self):
+        sampler = kbrank.UniformPairSampler(kbrank.BIGRAM_IDS, seed=7)
+        comparisons = [
+            {"a": kbrank.BIGRAM_IDS[0], "b": kbrank.BIGRAM_IDS[1], "result": "a"}
+        ]
+        self.assertEqual(
+            sampler.next_pair(comparisons), sampler.next_pair(comparisons)
+        )
+
+    def test_anchored_pairs_always_include_an_anchor(self):
+        sampler = kbrank.UniformPairSampler(kbrank.CANON_IDS, 7, anchors=["r1c5"])
+        comparisons = []
+        opponents = set()
+        for _ in range(14):
+            a, b = sampler.next_pair(comparisons)
+            self.assertIn("r1c5", (a, b))
+            opponent = b if a == "r1c5" else a
+            opponents.add(opponent)
+            comparisons.append({"a": a, "b": b, "result": "a"})
+        self.assertEqual(len(opponents), 14)
+        self.assertEqual(opponents, set(kbrank.CANON_IDS) - {"r1c5"})
+
+    def test_compatible_filter_forbids_double_crosshand(self):
+        sampler = kbrank.UniformPairSampler(
+            kbrank.ALL_BIGRAM_IDS,
+            7,
+            compatible=lambda a, b: not (kbrank.is_crosshand(a) and kbrank.is_crosshand(b)),
+        )
+        comparisons = []
+        for _ in range(50):
+            a, b = sampler.next_pair(comparisons)
+            self.assertFalse(kbrank.is_crosshand(a) and kbrank.is_crosshand(b))
+            comparisons.append({"a": a, "b": b, "result": "a"})
+
+    def test_uniform_over_pairs(self):
+        pairs = set()
+        for seed in range(300):
+            sampler = kbrank.UniformPairSampler(kbrank.CANON_IDS, seed)
+            pairs.add(frozenset(sampler.next_pair([])))
+        self.assertGreaterEqual(len(pairs), 60)
+
+
+class SoftBalancedSamplerTests(unittest.TestCase):
+    def test_weight_ordering_matches_requested_inequalities(self):
+        self.assertGreater(kbrank.soft_weight(1, 2.0), kbrank.soft_weight(2, 2.0))
+        self.assertGreater(kbrank.soft_weight(2, 2.0), 100 * kbrank.soft_weight(100, 2.0))
+        self.assertGreater(kbrank.soft_weight(100, 2.0), 0.0)
+        self.assertEqual(kbrank.soft_weight(5, 0.0), kbrank.soft_weight(50, 0.0))
+
+    def test_marginal_frequency_decreases_with_count(self):
+        history = [
+            {"a": "r1c1", "b": "r1c2", "result": "a"},
+            {"a": "r1c1", "b": "r1c2", "result": "a"},
+            {"a": "r1c1", "b": "r1c3", "result": "a"},
+            {"a": "r1c4", "b": "r1c5", "result": "a"},
+        ]
+        # counts: r1c1 -> 3, r1c2 -> 2, r1c3 -> 1, r1c4 -> 1, r1c5 -> 1, rest -> 0
+        tally = collections.Counter()
+        for seed in range(2000):
+            sampler = kbrank.SoftBalancedPairSampler(kbrank.CANON_IDS, seed)
+            a, b = sampler.next_pair(history)
+            tally[a] += 1
+            tally[b] += 1
+        count0 = [k for k in kbrank.CANON_IDS if k not in ("r1c1", "r1c2", "r1c3", "r1c4", "r1c5")]
+        freq0 = sum(tally[k] for k in count0) / len(count0)
+        self.assertGreater(freq0, tally["r1c3"])
+        self.assertGreater(tally["r1c3"], tally["r1c2"])
+        self.assertGreater(tally["r1c2"], tally["r1c1"])
+
+    def test_sits_between_balanced_and_uniform_on_coverage(self):
+        def max_count(sampler_cls):
+            sampler = sampler_cls(kbrank.BIGRAM_IDS, seed=7)
+            comparisons = []
+            counts = {k: 0 for k in kbrank.BIGRAM_IDS}
+            for _ in range(400):
+                a, b = sampler.next_pair(comparisons)
+                counts[a] += 1
+                counts[b] += 1
+                comparisons.append({"a": a, "b": b, "result": "a"})
+            return counts
+
+        balanced = max_count(kbrank.BalancedPairSampler)
+        soft = max_count(kbrank.SoftBalancedPairSampler)
+        uniform = max_count(kbrank.UniformPairSampler)
+        self.assertLessEqual(max(balanced.values()), max(soft.values()))
+        self.assertLess(max(soft.values()), max(uniform.values()))
+
+    def test_deterministic_given_history(self):
+        sampler = kbrank.SoftBalancedPairSampler(kbrank.BIGRAM_IDS, seed=7)
+        comparisons = [
+            {"a": kbrank.BIGRAM_IDS[0], "b": kbrank.BIGRAM_IDS[1], "result": "a"}
+        ]
+        self.assertEqual(
+            sampler.next_pair(comparisons), sampler.next_pair(comparisons)
+        )
+
+    def test_anchored_pairs_always_include_an_anchor(self):
+        sampler = kbrank.SoftBalancedPairSampler(kbrank.CANON_IDS, 7, anchors=["r1c5"])
+        comparisons = []
+        for _ in range(14):
+            a, b = sampler.next_pair(comparisons)
+            self.assertIn("r1c5", (a, b))
+            comparisons.append({"a": a, "b": b, "result": "a"})
+
+    def test_compatible_filter_forbids_double_crosshand(self):
+        sampler = kbrank.SoftBalancedPairSampler(
+            kbrank.ALL_BIGRAM_IDS,
+            7,
+            compatible=lambda a, b: not (kbrank.is_crosshand(a) and kbrank.is_crosshand(b)),
+        )
+        comparisons = []
+        for _ in range(50):
+            a, b = sampler.next_pair(comparisons)
+            self.assertFalse(kbrank.is_crosshand(a) and kbrank.is_crosshand(b))
+            comparisons.append({"a": a, "b": b, "result": "a"})
+
+    def test_repeat_pair_is_suppressed_not_forbidden(self):
+        # A 3-item universe with the third item unseen makes the asked pair the
+        # least favoured candidate on both factors (own count and pair count), so
+        # observing it at all requires many more than 200 draws; 2000 deterministic
+        # seeds keeps this reproducible while still landing far under the 20% cap.
+        universe = ["r1c1", "r1c2", "r1c3"]
+        history = [{"a": "r1c1", "b": "r1c2", "result": "a"}]
+        repeats = 0
+        seeds = 2000
+        for seed in range(seeds):
+            sampler = kbrank.SoftBalancedPairSampler(universe, seed)
+            a, b = sampler.next_pair(history)
+            if frozenset((a, b)) == frozenset(("r1c1", "r1c2")):
+                repeats += 1
+        self.assertGreater(repeats, 0)
+        self.assertLess(repeats, 0.2 * seeds)
 
 
 class SparseFitTests(unittest.TestCase):
@@ -655,6 +812,80 @@ class OnlyFilterTests(unittest.TestCase):
             self.assertEqual(cells[:5], list(reversed(cells[5:])))
             found_dash = found_dash or "-" in cells
         self.assertTrue(found_dash)
+
+    def test_ask_keys_no_bias_end_to_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            nb_path = os.path.join(d, "nb.json")
+            with mock.patch("builtins.input", side_effect=["1"] * 8):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    kbrank.main(
+                        [
+                            "ask",
+                            "--mode",
+                            "keys",
+                            "--state",
+                            nb_path,
+                            "--seed",
+                            "7",
+                            "--no-bias",
+                            "-n",
+                            "8",
+                        ]
+                    )
+            with open(nb_path) as f:
+                nb_state = json.load(f)
+            self.assertEqual(len(nb_state["comparisons"]), 8)
+            nb_pairs = [(c["a"], c["b"]) for c in nb_state["comparisons"]]
+            self.assertEqual(len({frozenset(p) for p in nb_pairs}), 8)
+            kbrank.load_state(nb_path)
+
+            bal_path = os.path.join(d, "bal.json")
+            with mock.patch("builtins.input", side_effect=["1"] * 8):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    kbrank.main(
+                        [
+                            "ask",
+                            "--mode",
+                            "keys",
+                            "--state",
+                            bal_path,
+                            "--seed",
+                            "7",
+                            "-n",
+                            "8",
+                        ]
+                    )
+            with open(bal_path) as f:
+                bal_state = json.load(f)
+            bal_pairs = [(c["a"], c["b"]) for c in bal_state["comparisons"]]
+            self.assertNotEqual(nb_pairs, bal_pairs)
+
+    def test_ask_bigrams_no_bias_with_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "nbb.json")
+            with mock.patch("builtins.input", side_effect=["1"] * 6):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    kbrank.main(
+                        [
+                            "ask",
+                            "--mode",
+                            "bigrams",
+                            "--state",
+                            path,
+                            "--only",
+                            "r1c1",
+                            "r1c2",
+                            "--no-bias",
+                            "-n",
+                            "6",
+                        ]
+                    )
+            with open(path) as f:
+                state = json.load(f)
+            comparisons = state["comparisons"]
+            self.assertEqual(len(comparisons), 6)
+            anchors = set(kbrank.parse_only(["r1c1", "r1c2"], "bigrams"))
+            self.assertTrue(all({c["a"], c["b"]} & anchors for c in comparisons))
 
 
 if __name__ == "__main__":
