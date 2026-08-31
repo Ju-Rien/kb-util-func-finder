@@ -54,12 +54,35 @@ def mirror_id(key_id: str) -> str:
     return f"r{key.row}c{mirror_col(key.col)}"
 
 
-def _grid_lines(cell_for_key) -> list[str]:
+_COLOR_UPPER = "\033[33m"  # yellow: uppercase mark (sequence as given, starts left)
+_COLOR_LOWER = "\033[94m"  # light blue: lowercase mark (its mirror, starts right)
+_COLOR_RESET = "\033[0m"
+
+
+def _colorize_marks(text: str) -> str:
+    """Color each 2-char mark token (e.g. 'A1', 'a2') within `text` individually:
+    yellow for uppercase (the sequence as given, starting on the left), light
+    blue for lowercase (its mirror, starting on the right). `text` is one or two
+    concatenated 2-char tokens, or '.' for an empty cell.
+    """
+    if text == ".":
+        return text
+    tokens = []
+    for i in range(0, len(text), 2):
+        token = text[i : i + 2]
+        color = _COLOR_UPPER if token[0].isupper() else _COLOR_LOWER
+        tokens.append(f"{color}{token}{_COLOR_RESET}")
+    return "".join(tokens)
+
+
+def _grid_lines(cell_for_key, colorize: bool = False) -> list[str]:
     """Shared 3x10 grid layout used by both the question grid and the rank map.
 
     Row-label column is 6 chars wide; each key cell is right-aligned in width
     4; an extra 2-space gutter separates c5 from c6 so the two hands read
-    apart visually.
+    apart visually. `colorize`, when set, colors each mark by case (see
+    `_colorize_marks`) so the sequence-as-given and its mirror are easy to
+    tell apart regardless of which grid half they land in.
     """
     lines: list[str] = []
 
@@ -74,7 +97,12 @@ def _grid_lines(cell_for_key) -> list[str]:
         parts = [f"  r{r}".ljust(6)]
         for c in range(1, COLS + 1):
             key = KEYS_BY_ID[f"r{r}c{c}"]
-            parts.append(cell_for_key(key).rjust(4))
+            text = cell_for_key(key)
+            if colorize and text != ".":
+                cell = " " * (4 - len(text)) + _colorize_marks(text)
+            else:
+                cell = text.rjust(4)
+            parts.append(cell)
             if c == 5:
                 parts.append("  ")
         lines.append("".join(parts))
@@ -100,6 +128,18 @@ BIGRAM_IDS = [f"{a}{BIGRAM_SEP}{b}" for a in CANON_IDS for b in CANON_IDS]
 N_BIGRAMS = N_POS * N_POS  # 225
 
 
+CROSSHAND_BIGRAM_IDS = [
+    f"{a}{BIGRAM_SEP}{mirror_id(b)}" for a in CANON_IDS for b in CANON_IDS
+]
+N_CROSSHAND_BIGRAMS = N_POS * N_POS  # 225
+ALL_BIGRAM_IDS = BIGRAM_IDS + CROSSHAND_BIGRAM_IDS
+
+
+def is_crosshand(bigram_id: str) -> bool:
+    """True when the second key of `bigram_id` sits on the opposite half."""
+    return KEYS_BY_ID[split_bigram(bigram_id)[1]].col > HALF_COLS
+
+
 def split_bigram(bigram_id: str) -> tuple[str, str]:
     first, second = bigram_id.split(BIGRAM_SEP)
     return first, second
@@ -108,10 +148,11 @@ def split_bigram(bigram_id: str) -> tuple[str, str]:
 def describe_bigram(bigram_id: str) -> str:
     first, second = split_bigram(bigram_id)
     k1, k2 = KEYS_BY_ID[first], KEYS_BY_ID[second]
-    return (
+    text = (
         f"row {k1.row} cols {k1.col}|{mirror_col(k1.col)} -> "
         f"row {k2.row} cols {k2.col}|{mirror_col(k2.col)}"
     )
+    return f"{text} (other hand)" if is_crosshand(bigram_id) else text
 
 
 _RC_RE = re.compile(r"r(\d+)c(\d+)", re.IGNORECASE)
@@ -119,15 +160,29 @@ _TUPLE_RE = re.compile(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)")
 
 
 def _parse_coords(spec: str) -> list[str] | None:
-    """Canonical mirror ids for every coordinate in `spec`; None if one is off-grid."""
+    """Raw key ids for every coordinate in `spec`; None if one is off-grid."""
     found = _RC_RE.findall(spec) or _TUPLE_RE.findall(spec)
     ids = []
     for r, c in found:
         r, c = int(r), int(c)
         if not (1 <= r <= ROWS and 1 <= c <= COLS):
             return None
-        ids.append(canonical_id(f"r{r}c{c}"))
+        ids.append(f"r{r}c{c}")
     return ids
+
+
+def canonicalize_bigram(first_raw: str, second_raw: str) -> str:
+    """Fold a raw ordered key pair onto the canonical item space.
+
+    The first key is folded to the left half; the second keeps its hand relative
+    to the first, so a hand change in the input yields a cross-hand item.
+    """
+    first = canonical_id(first_raw)
+    second = canonical_id(second_raw)
+    same_half = (KEYS_BY_ID[first_raw].col <= HALF_COLS) == (
+        KEYS_BY_ID[second_raw].col <= HALF_COLS
+    )
+    return f"{first}{BIGRAM_SEP}{second if same_half else mirror_id(second)}"
 
 
 def parse_bigram(spec: str) -> str:
@@ -139,10 +194,10 @@ def parse_bigram(spec: str) -> str:
             file=sys.stderr,
         )
         sys.exit(2)
-    return f"{ids[0]}{BIGRAM_SEP}{ids[1]}"
+    return canonicalize_bigram(ids[0], ids[1])
 
 
-def parse_only(specs: list[str], mode: str) -> list[str]:
+def parse_only(specs: list[str], mode: str, allow_crosshand: bool = False) -> list[str]:
     """Expand `--only` tokens into the anchor list, in canonical order.
 
     A token with one coordinate is a key ('r2c1', '(2,1)'); a token with two is a
@@ -163,7 +218,7 @@ def parse_only(specs: list[str], mode: str) -> list[str]:
             )
             sys.exit(2)
         if len(ids) == 1:
-            keys.append(ids[0])
+            keys.append(canonical_id(ids[0]))
         elif mode == "keys":
             print(
                 f"--only entry {spec!r} is a sequence; sequences require --mode bigrams",
@@ -171,14 +226,25 @@ def parse_only(specs: list[str], mode: str) -> list[str]:
             )
             sys.exit(2)
         else:
-            seqs.append(f"{ids[0]}{BIGRAM_SEP}{ids[1]}")
+            seqs.append(canonicalize_bigram(ids[0], ids[1]))
 
     if mode == "keys":
         items = set(keys)
         universe = CANON_IDS
     else:
+        if not allow_crosshand:
+            for s in seqs:
+                if is_crosshand(s):
+                    print(
+                        f"--only entry {s!r} is a cross-hand sequence; add --allow-crosshand",
+                        file=sys.stderr,
+                    )
+                    sys.exit(2)
         items = {f"{a}{BIGRAM_SEP}{b}" for a in keys for b in keys} | set(seqs)
         universe = BIGRAM_IDS
+        if allow_crosshand:
+            items |= {f"{a}{BIGRAM_SEP}{mirror_id(b)}" for a in keys for b in keys}
+            universe = ALL_BIGRAM_IDS
 
     ordered = [i for i in universe if i in items]
     if not ordered:
@@ -187,23 +253,34 @@ def parse_only(specs: list[str], mode: str) -> list[str]:
     return ordered
 
 
-def render_sequence_grid(bigram_id: str, upper: str, lower: str) -> str:
+def render_sequence_grid(
+    bigram_id: str, upper: str, lower: str, colorize: bool = False
+) -> str:
     first, second = split_bigram(bigram_id)
     marks: dict[str, str] = {}
     for pos, kid in ((1, first), (2, second)):
         marks[kid] = marks.get(kid, "") + f"{upper}{pos}"
         mid = mirror_id(kid)
         marks[mid] = marks.get(mid, "") + f"{lower}{pos}"
-    return "\n".join(_grid_lines(lambda key: marks.get(key.id, ".")))
+    return "\n".join(
+        _grid_lines(lambda key: marks.get(key.id, "."), colorize=colorize)
+    )
 
 
-def render_bigram_pair(id1: str, id2: str) -> str:
+def _label(n: int, bid: str) -> str:
+    return f"Sequence {n} (cross-hand):" if is_crosshand(bid) else f"Sequence {n}:"
+
+
+def render_bigram_pair(id1: str, id2: str, colorize: bool = False) -> str:
+    legend = "Lowercase cells are the same sequence on the other hand."
+    if colorize:
+        legend += " Yellow = uppercase (left-starting), light blue = lowercase (right-starting)."
     return (
-        "Sequence 1:\n"
-        f"{render_sequence_grid(id1, 'A', 'a')}\n"
-        "Sequence 2:\n"
-        f"{render_sequence_grid(id2, 'B', 'b')}\n"
-        "Lowercase cells are the same sequence on the other hand."
+        f"{_label(1, id1)}\n"
+        f"{render_sequence_grid(id1, 'A', 'a', colorize=colorize)}\n"
+        f"{_label(2, id2)}\n"
+        f"{render_sequence_grid(id2, 'B', 'b', colorize=colorize)}\n"
+        f"{legend}"
     )
 
 
@@ -296,6 +373,7 @@ def load_bigram_state(path: str, seed: int | None = None) -> dict:
             "kind": "bigrams",
             "grid": [ROWS, COLS],
             "symmetric": True,
+            "crosshand": False,
             "seed": seed if seed is not None else random.randrange(2**31),
             "comparisons": [],
         }
@@ -323,7 +401,7 @@ def load_bigram_state(path: str, seed: int | None = None) -> dict:
         )
         sys.exit(2)
 
-    valid_ids = set(BIGRAM_IDS)
+    valid_ids = set(ALL_BIGRAM_IDS)
     for idx, cmp in enumerate(state.get("comparisons", [])):
         if cmp.get("a") not in valid_ids or cmp.get("b") not in valid_ids:
             print(
@@ -338,6 +416,10 @@ def load_bigram_state(path: str, seed: int | None = None) -> dict:
             )
             sys.exit(2)
 
+    state["crosshand"] = bool(state.get("crosshand")) or any(
+        is_crosshand(c["a"]) or is_crosshand(c["b"]) for c in state["comparisons"]
+    )
+
     if seed is not None:
         print(
             f"note: --seed ignored; resuming with stored seed {state['seed']}",
@@ -345,6 +427,10 @@ def load_bigram_state(path: str, seed: int | None = None) -> dict:
         )
 
     return state
+
+
+def bigram_universe(state: dict) -> list[str]:
+    return ALL_BIGRAM_IDS if state.get("crosshand") else BIGRAM_IDS
 
 
 def save_state(path: str, state: dict) -> None:
@@ -476,13 +562,22 @@ class PairSampler:
 class BalancedPairSampler:
     """Always compares the two least-compared items, so coverage stays even over a
     space too large to exhaust. With `anchors`, the first side is always drawn from
-    that subset and the opponent from the full item list. Pure function of
-    (seed, comparison history), so resume and undo are deterministic without
+    that subset and the opponent from the full item list. With `compatible`, the
+    opponent is additionally restricted to items for which `compatible(a, k)` holds
+    (e.g. forbidding two cross-hand sequences from facing each other). Pure function
+    of (seed, comparison history), so resume and undo are deterministic without
     persisting a cursor."""
 
-    def __init__(self, item_ids: list[str], seed: int, anchors: list[str] | None = None):
+    def __init__(
+        self,
+        item_ids: list[str],
+        seed: int,
+        anchors: list[str] | None = None,
+        compatible: Callable[[str, str], bool] | None = None,
+    ):
         self.items = list(item_ids)
         self.anchors = list(anchors) if anchors is not None else self.items
+        self.compatible = compatible
         rng = random.Random(seed)
         order = list(range(len(self.items)))
         rng.shuffle(order)
@@ -497,8 +592,13 @@ class BalancedPairSampler:
             seen.add(frozenset((c["a"], c["b"])))
         tb = self.tiebreak
         a = min(self.anchors, key=lambda k: (counts[k], tb[k]))
+        candidates = (
+            k
+            for k in self.items
+            if k != a and (self.compatible is None or self.compatible(a, k))
+        )
         b = min(
-            (k for k in self.items if k != a),
+            candidates,
             key=lambda k: (frozenset((a, k)) in seen, counts[k], tb[k]),
         )
         return a, b
@@ -554,9 +654,12 @@ def _build_ranking(state: dict, bootstrap: int) -> tuple[list[dict], list[str]]:
 
 
 def _build_bigram_ranking(state: dict, bootstrap: int) -> tuple[list[dict], list[str]]:
-    ranking, zero_ids = _fit_ranking(BIGRAM_IDS, state["comparisons"], state["seed"], bootstrap)
+    ranking, zero_ids = _fit_ranking(
+        bigram_universe(state), state["comparisons"], state["seed"], bootstrap
+    )
     for row in ranking:
         first, second = split_bigram(row["id"])
+        row["crosshand"] = is_crosshand(row["id"])
         for label, kid in (("from", first), ("to", second)):
             key = KEYS_BY_ID[kid]
             row[label] = {
@@ -643,33 +746,41 @@ def _print_report(state: dict, bootstrap: int, json_output: bool) -> None:
 def _print_bigram_report(state: dict, bootstrap: int, json_output: bool, top: int) -> None:
     comparisons = state["comparisons"]
     ranking, zero_ids = _build_bigram_ranking(state, bootstrap)
+    universe = bigram_universe(state)
+    n_items = len(universe)
 
-    if len(comparisons) < 2 * N_BIGRAMS:
+    if len(comparisons) < 2 * n_items:
         print(
-            f"only {len(comparisons)} comparisons for {N_BIGRAMS} sequences; "
+            f"only {len(comparisons)} comparisons for {n_items} sequences; "
             "ranking is weak - run 'kbrank ask --mode bigrams' for more",
             file=sys.stderr,
         )
     if zero_ids:
         print(
-            f"{len(zero_ids)} of {N_BIGRAMS} sequences have zero comparisons",
+            f"{len(zero_ids)} of {n_items} sequences have zero comparisons",
             file=sys.stderr,
         )
 
     if json_output:
         out = {
             "mode": "bigrams",
-            "n_items": N_BIGRAMS,
+            "n_items": n_items,
             "n_comparisons": len(comparisons),
             "grid": [ROWS, COLS],
             "symmetric": True,
+            "crosshand": state["crosshand"],
             "ranking": ranking,
         }
         print(json.dumps(out))
         return
 
+    scope = (
+        f"{N_BIGRAMS} same-hand + {N_CROSSHAND_BIGRAMS} cross-hand"
+        if state["crosshand"]
+        else "same-hand"
+    )
     print(
-        f"{N_BIGRAMS} two-key sequences over {N_POS} mirror positions (repeats included), "
+        f"{n_items} two-key sequences over {N_POS} mirror positions ({scope}, repeats included), "
         f"{len(comparisons)} comparisons"
     )
     print(
@@ -704,6 +815,15 @@ def _print_bigram_report(state: dict, bootstrap: int, json_output: bool, top: in
 
 def _print_bigram_compare(state: dict, bootstrap: int, specs: list[str]) -> None:
     left, right = (parse_bigram(s) for s in specs)
+    universe = bigram_universe(state)
+    for seq in (left, right):
+        if seq not in universe:
+            print(
+                f"{seq} is a cross-hand sequence but this session has no cross-hand data; "
+                "collect some with 'kbrank ask --mode bigrams --allow-crosshand'",
+                file=sys.stderr,
+            )
+            sys.exit(2)
     ranking, _ = _build_bigram_ranking(state, bootstrap)
     by_id = {row["id"]: row for row in ranking}
 
@@ -715,7 +835,7 @@ def _print_bigram_compare(state: dict, bootstrap: int, specs: list[str]) -> None
                 file=sys.stderr,
             )
         return (
-            f"{seq:<10}  rank {row['rank']:>3}/{N_BIGRAMS}   "
+            f"{seq:<10}  rank {row['rank']:>3}/{len(universe)}   "
             f"utility {row['utility']:>+6.2f}   cmps {row['n_comparisons']:>4}"
         )
 
@@ -829,7 +949,17 @@ def _run_ask_session(
 
 def cmd_ask(args: argparse.Namespace) -> int:
     path = args.state or STATE_DEFAULTS[args.mode]
-    only = parse_only(args.only, args.mode) if args.only else None
+    if args.allow_crosshand and args.mode == "keys":
+        print("--allow-crosshand is only available with --mode bigrams", file=sys.stderr)
+        return 2
+    if args.color and args.mode == "keys":
+        print("--color is only available with --mode bigrams", file=sys.stderr)
+        return 2
+    only = (
+        parse_only(args.only, args.mode, allow_crosshand=args.allow_crosshand)
+        if args.only
+        else None
+    )
 
     if args.mode == "keys":
         state = load_state(path, seed=args.seed)
@@ -877,11 +1007,19 @@ def cmd_ask(args: argparse.Namespace) -> int:
         return 0
 
     state = load_bigram_state(path, seed=args.seed)
-    sampler = BalancedPairSampler(BIGRAM_IDS, state["seed"], anchors=only)
+    if args.allow_crosshand:
+        state["crosshand"] = True
+    universe = bigram_universe(state)
+    sampler = BalancedPairSampler(
+        universe,
+        state["seed"],
+        anchors=only,
+        compatible=lambda a, b: not (is_crosshand(a) and is_crosshand(b)),
+    )
     mode = AskMode(
         next_pair=lambda s: sampler.next_pair(s["comparisons"]),
         swap=_history_swap,
-        render=render_bigram_pair,
+        render=lambda id1, id2: render_bigram_pair(id1, id2, colorize=args.color),
         question="Which two-key sequence is more comfortable to type in order?",
         options=lambda id1, id2: (
             f"  1) A: {describe_bigram(id1)}\n  2) B: {describe_bigram(id2)}"
@@ -896,16 +1034,16 @@ def cmd_ask(args: argparse.Namespace) -> int:
             _print_bigram_report(state, bootstrap=50, json_output=False, top=20)
     else:
         n = args.n if args.n is not None else min(
-            BIGRAM_SESSION_QUESTIONS, _anchored_pair_count(len(only), N_BIGRAMS)
+            BIGRAM_SESSION_QUESTIONS, _anchored_pair_count(len(only), len(universe))
         )
         if n <= 0:
             print("-n must be positive", file=sys.stderr)
             return 2
         target = len(state["comparisons"]) + n
-        print(f"--only: {len(only)} of {N_BIGRAMS} items anchored, {n} pairs this run")
+        print(f"--only: {len(only)} of {len(universe)} items anchored, {n} pairs this run")
         _run_ask_session(state, path, target, mode, undo_floor=len(state["comparisons"]))
         if len(state["comparisons"]) >= target:
-            _print_anchor_summary(state, only, BIGRAM_IDS, BOOTSTRAP_DEFAULTS[args.mode])
+            _print_anchor_summary(state, only, universe, BOOTSTRAP_DEFAULTS[args.mode])
     return 0
 
 
@@ -986,6 +1124,20 @@ def build_parser() -> argparse.ArgumentParser:
              "one of them, the opponent ranges over the full space. 'r2c1' selects a "
              "key, 'r2c1-r2c2' a sequence (bigrams mode only). Whitespace-separated, "
              "flag repeatable. Prefer '-' over '>' to avoid shell redirection.",
+    )
+    ask_p.add_argument(
+        "--allow-crosshand",
+        action="store_true",
+        help="also sample cross-hand sequences (first key on one hand, second key on the "
+             "other): 225 extra items, ranked in the same table. A cross-hand sequence is "
+             "always paired against a same-hand one, never against another cross-hand "
+             "sequence (that comparison is redundant with mode keys).",
+    )
+    ask_p.add_argument(
+        "--color",
+        action="store_true",
+        help="colorize sequence-grid cells by hand (yellow = left, light blue = "
+             "right), mode bigrams only; off by default",
     )
     ask_p.set_defaults(func=cmd_ask)
 

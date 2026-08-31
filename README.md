@@ -6,7 +6,7 @@ A small terminal Python program to find your (non-unique) preferences/utility fu
 Use `kbrank ask` for keys or bigrams survey. A Bradley-Terry model (paired-comparison model, fit via regularized MM/Zermelo algorithm) is fit on the comparison data you input, producing a mean-centered log-strengths as your preference/utility values. Fit values can be seen with `kbrank report`.
 
 ```bash
-usage: kbrank ask [-h] [--mode {keys,bigrams}] [--state STATE] [-n N] [--seed SEED] [--only SPEC [SPEC ...]]
+usage: kbrank ask [-h] [--mode {keys,bigrams}] [--state STATE] [-n N] [--seed SEED] [--only SPEC [SPEC ...]] [--allow-crosshand] [--color]
 
 options:
   -h, --help            show this help message and exit
@@ -23,6 +23,12 @@ options:
                         opponent ranges over the full space. 'r2c1' selects a key, 'r2c1-r2c2' a sequence (bigrams
                         mode only). Whitespace-separated, flag repeatable. Prefer '-' over '>' to avoid shell
                         redirection.
+  --allow-crosshand     also sample cross-hand sequences (first key on one hand, second key on the other): 225 extra
+                        items, ranked in the same table. A cross-hand sequence is always paired against a same-hand
+                        one, never against another cross-hand sequence (that comparison is redundant with mode
+                        keys).
+  --color               colorize sequence-grid cells by hand (yellow = left, light blue = right), mode bigrams only;
+                        off by default
 ```
 
 ```bash

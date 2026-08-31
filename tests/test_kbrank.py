@@ -184,10 +184,17 @@ class BigramSpaceTests(unittest.TestCase):
         self.assertEqual(len(kbrank.BIGRAM_IDS), 225)
         self.assertEqual(len(set(kbrank.BIGRAM_IDS)), 225)
         self.assertIn("r1c3>r1c3", kbrank.BIGRAM_IDS)
+        self.assertEqual(len(kbrank.CROSSHAND_BIGRAM_IDS), 225)
+        self.assertEqual(len(set(kbrank.ALL_BIGRAM_IDS)), 450)
+        self.assertTrue(set(kbrank.BIGRAM_IDS).isdisjoint(kbrank.CROSSHAND_BIGRAM_IDS))
+        self.assertIs(kbrank.is_crosshand("r1c3>r1c8"), True)
+        self.assertIs(kbrank.is_crosshand("r1c3>r1c3"), False)
 
     def test_parse_bigram_forms(self):
         self.assertEqual(kbrank.parse_bigram("(2,1)-(2,2)"), "r2c1>r2c2")
-        self.assertEqual(kbrank.parse_bigram("r1c8>r1c3"), "r1c3>r1c3")
+        self.assertEqual(kbrank.parse_bigram("r1c8>r1c3"), "r1c3>r1c8")
+        self.assertEqual(kbrank.parse_bigram("r1c3>r1c8"), "r1c3>r1c8")
+        self.assertEqual(kbrank.parse_bigram("r1c8>r1c7"), "r1c3>r1c4")
 
     def test_parse_bigram_rejects_bad_input(self):
         with self.assertRaises(SystemExit) as ctx:
@@ -214,6 +221,12 @@ class BigramGridTests(unittest.TestCase):
 
     def test_repeat_position(self):
         self._assert_well_formed("r1c4>r1c4", "A1A2")
+
+    def test_crosshand_same_position(self):
+        self._assert_well_formed("r1c3>r1c8", "A1a2")
+
+    def test_crosshand_distinct_positions(self):
+        self._assert_well_formed("r1c1>r2c9", "A1")
 
 
 class BigramStateTests(unittest.TestCase):
@@ -258,6 +271,44 @@ class BigramStateTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 kbrank.load_bigram_state(path)
             self.assertEqual(ctx.exception.code, 2)
+
+    def test_crosshand_comparison_accepted_and_flag_inferred(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "crosshand.json")
+            with open(path, "w") as f:
+                json.dump(
+                    {
+                        "version": 1,
+                        "kind": "bigrams",
+                        "grid": [3, 10],
+                        "seed": 1,
+                        "comparisons": [
+                            {"a": "r1c3>r1c8", "b": "r2c1>r2c2", "result": "a", "t": 1.0}
+                        ],
+                    },
+                    f,
+                )
+            state = kbrank.load_bigram_state(path)
+            self.assertIs(state["crosshand"], True)
+            self.assertEqual(len(kbrank.bigram_universe(state)), 450)
+
+            same_hand_path = os.path.join(d, "samehand.json")
+            with open(same_hand_path, "w") as f:
+                json.dump(
+                    {
+                        "version": 1,
+                        "kind": "bigrams",
+                        "grid": [3, 10],
+                        "seed": 1,
+                        "comparisons": [
+                            {"a": "r1c1>r1c2", "b": "r2c1>r2c2", "result": "a", "t": 1.0}
+                        ],
+                    },
+                    f,
+                )
+            same_hand_state = kbrank.load_bigram_state(same_hand_path)
+            self.assertIs(same_hand_state["crosshand"], False)
+            self.assertEqual(len(kbrank.bigram_universe(same_hand_state)), 225)
 
 
 class BalancedSamplerTests(unittest.TestCase):
@@ -330,6 +381,21 @@ class OnlyFilterTests(unittest.TestCase):
         self.assertIn("r1c1>r1c1", result)
         self.assertEqual(len(result), 2)
 
+    def test_parse_only_crosshand_expansion(self):
+        self.assertEqual(
+            kbrank.parse_only(["r1c1"], "bigrams", allow_crosshand=True),
+            ["r1c1>r1c1", "r1c1>r1c10"],
+        )
+
+    def test_parse_only_rejects_crosshand_without_flag(self):
+        with self.assertRaises(SystemExit) as ctx:
+            kbrank.parse_only(["r1c1-r1c10"], "bigrams")
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertEqual(
+            kbrank.parse_only(["r1c1-r1c10"], "bigrams", allow_crosshand=True),
+            ["r1c1>r1c10"],
+        )
+
     def test_parse_only_rejects_bad_input(self):
         with self.assertRaises(SystemExit) as ctx:
             kbrank.parse_only(["r1c1-r1c2"], "keys")
@@ -377,6 +443,54 @@ class OnlyFilterTests(unittest.TestCase):
                     outside = True
             self.assertTrue(outside)
             kbrank.load_bigram_state(path)
+
+    def test_ask_bigrams_crosshand_end_to_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "crosshand.json")
+            with mock.patch("builtins.input", side_effect=["1"] * 6):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    kbrank.main(
+                        [
+                            "ask",
+                            "--mode",
+                            "bigrams",
+                            "--state",
+                            path,
+                            "--allow-crosshand",
+                            "--only",
+                            "r1c1-r1c10",
+                            "-n",
+                            "6",
+                        ]
+                    )
+            state = kbrank.load_bigram_state(path)
+            self.assertIs(state["crosshand"], True)
+            self.assertEqual(len(state["comparisons"]), 6)
+            for c in state["comparisons"]:
+                self.assertIn("r1c1>r1c10", (c["a"], c["b"]))
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                kbrank.main(
+                    [
+                        "report",
+                        "--mode",
+                        "bigrams",
+                        "--state",
+                        path,
+                        "--bootstrap",
+                        "0",
+                        "--json",
+                    ]
+                )
+            report = json.loads(out.getvalue())
+            self.assertIs(report["crosshand"], True)
+            self.assertEqual(report["n_items"], 450)
+
+    def test_ask_keys_rejects_crosshand_flag(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = kbrank.main(["ask", "--mode", "keys", "--allow-crosshand"])
+        self.assertEqual(code, 2)
 
     def test_ask_keys_end_to_end_filtered(self):
         with tempfile.TemporaryDirectory() as d:
@@ -473,6 +587,18 @@ class OnlyFilterTests(unittest.TestCase):
             self.assertEqual(pair_e, pair_d)
             comparisons_explicit.append({"a": pair_e[0], "b": pair_e[1], "result": "a"})
             comparisons_default.append({"a": pair_d[0], "b": pair_d[1], "result": "a"})
+
+    def test_compatible_filter_forbids_double_crosshand(self):
+        sampler = kbrank.BalancedPairSampler(
+            kbrank.ALL_BIGRAM_IDS,
+            7,
+            compatible=lambda a, b: not (kbrank.is_crosshand(a) and kbrank.is_crosshand(b)),
+        )
+        comparisons = []
+        for _ in range(300):
+            a, b = sampler.next_pair(comparisons)
+            self.assertFalse(kbrank.is_crosshand(a) and kbrank.is_crosshand(b))
+            comparisons.append({"a": a, "b": b, "result": "a"})
 
     def test_anchored_summary_reports_global_rank(self):
         comparisons = [
