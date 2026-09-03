@@ -887,6 +887,157 @@ class OnlyFilterTests(unittest.TestCase):
             anchors = set(kbrank.parse_only(["r1c1", "r1c2"], "bigrams"))
             self.assertTrue(all({c["a"], c["b"]} & anchors for c in comparisons))
 
+    def test_rank_pair_queue_unanchored_window_order(self):
+        ranking = [{"id": f"x{i}"} for i in range(5)]
+        queue = kbrank.rank_pair_queue(ranking, window=2)
+        self.assertEqual(
+            queue,
+            [
+                ("x0", "x1"), ("x0", "x2"),
+                ("x1", "x2"), ("x1", "x3"),
+                ("x2", "x3"), ("x2", "x4"),
+                ("x3", "x4"),
+            ],
+        )
+
+    def test_rank_pair_queue_anchor_window_clamps_at_edges(self):
+        ranking = [{"id": f"x{i}"} for i in range(5)]
+        # rank-1 item: no previous neighbours, window clamps to what's available.
+        first = kbrank.rank_pair_queue(ranking, window=3, anchors=["x0"])
+        self.assertEqual(first, [("x0", "x1"), ("x0", "x2"), ("x0", "x3")])
+        # rank-last item: no next neighbours.
+        last = kbrank.rank_pair_queue(ranking, window=3, anchors=["x4"])
+        self.assertEqual(last, [("x1", "x4"), ("x2", "x4"), ("x3", "x4")])
+
+    def test_rank_pair_queue_drops_incompatible_pairs(self):
+        ranking = [
+            {"id": bid}
+            for bid in kbrank.CROSSHAND_BIGRAM_IDS[:3] + kbrank.BIGRAM_IDS[:3]
+        ]
+        compatible = lambda a, b: not (kbrank.is_crosshand(a) and kbrank.is_crosshand(b))
+        queue = kbrank.rank_pair_queue(ranking, window=5, compatible=compatible)
+        for a, b in queue:
+            self.assertFalse(kbrank.is_crosshand(a) and kbrank.is_crosshand(b))
+        # full K6 has 15 pairs; the 3 crosshand items form a mutually-forbidden
+        # triangle, so exactly 3 pairs are dropped.
+        self.assertEqual(len(queue), 15 - 3)
+
+    def test_rank_pair_queue_start_skips_better_ranks(self):
+        ranking = [{"id": f"x{i}"} for i in range(5)]
+        self.assertEqual(
+            kbrank.rank_pair_queue(ranking, window=2, start=3),
+            [("x2", "x3"), ("x2", "x4"), ("x3", "x4")],
+        )
+
+    def test_rank_pair_queue_start_rejects_anchors(self):
+        ranking = [{"id": f"x{i}"} for i in range(5)]
+        with self.assertRaises(ValueError):
+            kbrank.rank_pair_queue(ranking, window=2, start=3, anchors=["x0"])
+
+    def test_ask_current_rank_pairs_keys_window(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "k.json")
+            kbrank.save_state(
+                path, {"version": 2, "grid": [3, 10], "seed": 1, "comparisons": []}
+            )
+            out = io.StringIO()
+            with mock.patch("builtins.input", side_effect=["1"] * 27 + ["q"]):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    kbrank.main(["ask", "--state", path, "--current-rank-pairs", "-n", "2"])
+            text = out.getvalue()
+            self.assertIn(
+                "--current-rank-pairs: window 2 from rank 1 over 15 ranked items, "
+                "27 pairs this run",
+                text,
+            )
+            self.assertIn("current ranks: #1", text)
+            cs = kbrank.load_state(path)["comparisons"]
+            self.assertEqual(len(cs), 27)
+            ids = kbrank.CANON_IDS
+            got = {tuple(sorted((c["a"], c["b"]))) for c in cs}
+            want = {
+                tuple(sorted((ids[i], ids[i + dd])))
+                for i in range(15)
+                for dd in (1, 2)
+                if i + dd < 15
+            }
+            self.assertEqual(got, want)
+
+    def test_ask_current_rank_pairs_only_bigrams(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "b.json")
+            out = io.StringIO()
+            with mock.patch("builtins.input", side_effect=["1"] * 40 + ["q"]):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    kbrank.main(
+                        [
+                            "ask", "--mode", "bigrams", "--state", path,
+                            "--current-rank-pairs", "--only", "r2c1-r2c3", "-n", "2",
+                        ]
+                    )
+            text = out.getvalue()
+            self.assertIn(
+                "--current-rank-pairs --only: 1 anchors, window 2, 4 pairs this run", text
+            )
+            cs = kbrank.load_bigram_state(path)["comparisons"]
+            self.assertEqual(len(cs), 4)
+            for c in cs:
+                self.assertIn("r2c1>r2c3", (c["a"], c["b"]))
+            ids = kbrank.BIGRAM_IDS
+            i = ids.index("r2c1>r2c3")
+            want = {
+                frozenset((ids[i - 2], ids[i])), frozenset((ids[i - 1], ids[i])),
+                frozenset((ids[i], ids[i + 1])), frozenset((ids[i], ids[i + 2])),
+            }
+            self.assertEqual({frozenset((c["a"], c["b"])) for c in cs}, want)
+
+    def test_ask_current_rank_pairs_start_rank(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "k.json")
+            kbrank.save_state(
+                path, {"version": 2, "grid": [3, 10], "seed": 1, "comparisons": []}
+            )
+            out = io.StringIO()
+            with mock.patch("builtins.input", side_effect=["1"] * 19 + ["q"]):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    kbrank.main(
+                        ["ask", "--state", path, "--current-rank-pairs", "5", "-n", "2"]
+                    )
+            text = out.getvalue()
+            self.assertIn(
+                "--current-rank-pairs: window 2 from rank 5 over 15 ranked items, "
+                "19 pairs this run",
+                text,
+            )
+            cs = kbrank.load_state(path)["comparisons"]
+            self.assertEqual(len(cs), 19)
+            ids = kbrank.CANON_IDS
+            got = {tuple(sorted((c["a"], c["b"]))) for c in cs}
+            want = {
+                tuple(sorted((ids[i], ids[i + dd])))
+                for i in range(4, 15)
+                for dd in (1, 2)
+                if i + dd < 15
+            }
+            self.assertEqual(got, want)
+            skipped = set(ids[0:4])
+            self.assertFalse(any({c["a"], c["b"]} & skipped for c in cs))
+
+    def test_ask_current_rank_pairs_guards(self):
+        for argv in (
+            ["ask", "--current-rank-pairs", "-n", "11"],
+            ["ask", "--current-rank-pairs", "-n", "0"],
+            ["ask", "--current-rank-pairs", "--no-bias"],
+            ["ask", "--current-rank-pairs", "--soft-bias"],
+            ["ask", "--current-rank-pairs", "5", "--only", "r1c1"],
+            ["ask", "--current-rank-pairs", "0"],
+            ["ask", "--current-rank-pairs", "15"],
+        ):
+            with self.subTest(argv=argv):
+                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                    code = kbrank.main(argv)
+                self.assertEqual(code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

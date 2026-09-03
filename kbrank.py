@@ -1027,6 +1027,94 @@ def _anchored_pair_count(n_anchors: int, n_universe: int) -> int:
     return n_universe * (n_universe - 1) // 2 - rest * (rest - 1) // 2
 
 
+RANK_PAIRS_MAX_WINDOW = 10
+
+
+def rank_pair_queue(
+    ranking: list[dict],
+    window: int,
+    start: int = 1,
+    anchors: list[str] | None = None,
+    compatible: Callable[[str, str], bool] | None = None,
+) -> list[tuple[str, str]]:
+    """Deterministic rank-neighbour pairs from a fitted `ranking` (ascending rank).
+
+    No anchors: rank i vs i+1..i+window, forward-only, in presentation order
+    (1,2),(1,3),(2,3),(2,4),... The unanchored sweep begins at rank `start`
+    (default 1, i.e. from the top); `start` is invalid together with
+    `anchors`. With anchors: each anchor (visited in ascending rank order) is
+    compared against the `window` items ranked immediately above it, then the
+    `window` immediately below it. `compatible`, when given, drops a pair
+    outright rather than backfilling the window. Duplicate unordered pairs
+    (only possible with overlapping anchor windows) are collapsed, keeping
+    the first occurrence.
+    """
+    if anchors is not None and start != 1:
+        raise ValueError("start applies only to the unanchored queue")
+
+    ids = [row["id"] for row in ranking]
+    seen: set[frozenset[str]] = set()
+    pairs: list[tuple[str, str]] = []
+
+    def emit(a: str, b: str) -> None:
+        if compatible is not None and not compatible(a, b):
+            return
+        key = frozenset((a, b))
+        if key in seen:
+            return
+        seen.add(key)
+        pairs.append((a, b))
+
+    if anchors is None:
+        for i in range(start - 1, len(ids) - 1):
+            for d in range(1, window + 1):
+                if i + d < len(ids):
+                    emit(ids[i], ids[i + d])
+        return pairs
+
+    anchor_set = set(anchors)
+    anchor_idx = [i for i, x in enumerate(ids) if x in anchor_set]
+    for i in anchor_idx:
+        for j in range(max(0, i - window), i):
+            emit(ids[j], ids[i])
+        for d in range(1, window + 1):
+            if i + d < len(ids):
+                emit(ids[i], ids[i + d])
+    return pairs
+
+
+class RankPairQueue:
+    """Deterministic pair source: hands out `pairs` in order, ignoring history."""
+
+    def __init__(self, pairs: list[tuple[str, str]]):
+        self.pairs = list(pairs)
+        self.cursor = 0
+
+    def next_pair(self, comparisons: list[dict]) -> tuple[str, str]:
+        if self.cursor >= len(self.pairs):
+            raise RuntimeError("rank-pair queue exhausted")
+        pair = self.pairs[self.cursor]
+        self.cursor += 1
+        return pair
+
+
+def _rank_context(ranking: list[dict]) -> Callable[[str, str], str]:
+    """(id1, id2) -> one header line naming each item's current rank and CI."""
+    info = {row["id"]: row for row in ranking}
+
+    def fmt(item_id: str) -> str:
+        row = info[item_id]
+        ci = row["rank_ci"]
+        if ci is None:
+            return f"#{row['rank']}"
+        return f"#{row['rank']} (CI {ci[0]}-{ci[1]})"
+
+    def ctx(id1: str, id2: str) -> str:
+        return f"current ranks: {fmt(id1)}  vs  {fmt(id2)}"
+
+    return ctx
+
+
 def _history_swap(state: dict) -> bool:
     return random.Random(f"{state['seed']}:{len(state['comparisons'])}").random() < 0.5
 
@@ -1105,6 +1193,120 @@ def cmd_ask(args: argparse.Namespace) -> int:
         if args.only
         else None
     )
+    if args.current_rank_pairs is not None:
+        if args.no_bias or args.soft_bias:
+            print(
+                "--no-bias/--soft-bias cannot be combined with --current-rank-pairs",
+                file=sys.stderr,
+            )
+            return 2
+        window = args.n if args.n is not None else 1
+        if not 1 <= window <= RANK_PAIRS_MAX_WINDOW:
+            print(
+                f"-n must be between 1 and {RANK_PAIRS_MAX_WINDOW} with --current-rank-pairs",
+                file=sys.stderr,
+            )
+            return 2
+
+        explicit_start = args.current_rank_pairs is not True
+        start = args.current_rank_pairs if explicit_start else 1
+        if explicit_start and only is not None:
+            print(
+                "--current-rank-pairs K cannot be combined with --only",
+                file=sys.stderr,
+            )
+            return 2
+
+        if args.mode == "keys":
+            state = load_state(path, seed=args.seed)
+            universe = CANON_IDS
+            ranking, _ = _build_ranking(state, BOOTSTRAP_DEFAULTS["keys"], fit_unseen=True)
+            compatible = None
+
+            def base_render(id1: str, id2: str) -> str:
+                return (
+                    render_grid(id1, id2)
+                    + "\nMirror cells (a)/[b] are the same position on the other hand."
+                )
+
+            def base_options(id1: str, id2: str) -> str:
+                k1, k2 = KEYS_BY_ID[id1], KEYS_BY_ID[id2]
+                return (
+                    f"  1) (A) row {k1.row}, cols {k1.col}|{mirror_col(k1.col)}      "
+                    f"2) [B] row {k2.row}, cols {k2.col}|{mirror_col(k2.col)}"
+                )
+
+            base_question = "Which key position is more comfortable to type?"
+        else:
+            state = load_bigram_state(path, seed=args.seed)
+            if args.allow_crosshand:
+                state["crosshand"] = True
+            universe = bigram_universe(state)
+            ranking, _ = _build_bigram_ranking(
+                state, BOOTSTRAP_DEFAULTS["bigrams"], fit_unseen=True
+            )
+            compatible = lambda a, b: not (is_crosshand(a) and is_crosshand(b))
+
+            def base_render(id1: str, id2: str) -> str:
+                return render_bigram_pair(id1, id2, colorize=args.color)
+
+            def base_options(id1: str, id2: str) -> str:
+                return f"  1) A: {describe_bigram(id1)}\n  2) B: {describe_bigram(id2)}"
+
+            base_question = "Which two-key sequence is more comfortable to type in order?"
+
+        if explicit_start and not 1 <= start <= len(ranking) - 1:
+            print(
+                f"--current-rank-pairs K must be between 1 and {len(ranking) - 1} "
+                f"({len(ranking)} ranked items)",
+                file=sys.stderr,
+            )
+            return 2
+
+        queue = rank_pair_queue(ranking, window, start, anchors=only, compatible=compatible)
+        if not queue:
+            print("--current-rank-pairs produced no pairs", file=sys.stderr)
+            return 2
+        source = RankPairQueue(queue)
+        ctx = _rank_context(ranking)
+        mode = AskMode(
+            next_pair=lambda s: source.next_pair(s["comparisons"]),
+            swap=_history_swap,
+            render=lambda id1, id2: ctx(id1, id2) + "\n\n" + base_render(id1, id2),
+            question=base_question,
+            options=base_options,
+        )
+        base = len(state["comparisons"])
+        if only is None:
+            print(
+                f"--current-rank-pairs: window {window} from rank {start} over "
+                f"{len(ranking)} ranked items, {len(queue)} pairs this run"
+            )
+        else:
+            print(
+                f"--current-rank-pairs --only: {len(only)} anchors, window {window}, "
+                f"{len(queue)} pairs this run"
+            )
+        _run_ask_session(state, path, base + len(queue), mode, undo_floor=base)
+        if len(state["comparisons"]) >= base + len(queue):
+            if only is not None:
+                _print_anchor_summary(
+                    state, only, universe, BOOTSTRAP_DEFAULTS[args.mode], fit_unseen=False
+                )
+            elif args.mode == "keys":
+                _print_report(
+                    state, bootstrap=BOOTSTRAP_DEFAULTS["keys"], json_output=False, fit_unseen=False
+                )
+            else:
+                _print_bigram_report(
+                    state,
+                    bootstrap=BOOTSTRAP_DEFAULTS["bigrams"],
+                    json_output=False,
+                    top=20,
+                    fit_unseen=False,
+                )
+        return 0
+
     if args.bias_alpha < 0:
         print("--bias-alpha must be >= 0", file=sys.stderr)
         return 2
@@ -1289,6 +1491,22 @@ def build_parser() -> argparse.ArgumentParser:
              "one of them, the opponent ranges over the full space. 'r2c1' selects a "
              "key, 'r2c1-r2c2' a sequence (bigrams mode only). Whitespace-separated, "
              "flag repeatable. Prefer '-' over '>' to avoid shell redirection.",
+    )
+    ask_p.add_argument(
+        "--current-rank-pairs",
+        nargs="?",
+        type=int,
+        const=True,
+        default=None,
+        metavar="K",
+        help="ask a fixed queue of rank-neighbour pairs instead of sampling: fit the "
+             "current ranking (unseen items included, default bootstrap for the mode) "
+             "and compare rank 1 vs 2, 2 vs 3, and so on. K starts the sweep at rank K "
+             "instead of rank 1, skipping every better-ranked item (bare flag = 1). "
+             "With -n W each item is compared against the next W items in rank order "
+             f"(W <= {RANK_PAIRS_MAX_WINDOW}); with --only each anchored item is "
+             "compared against the W items ranked above it and the W below it, and K "
+             "is not accepted. Cannot be combined with --no-bias or --soft-bias.",
     )
     sampler_g = ask_p.add_mutually_exclusive_group()
     sampler_g.add_argument(
