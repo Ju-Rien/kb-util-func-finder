@@ -6,6 +6,7 @@ import dataclasses
 import functools
 import json
 import math
+import numpy as np
 import os
 import random
 import re
@@ -446,54 +447,52 @@ def save_state(path: str, state: dict) -> None:
 # ----------------------------------------------------------------------------
 
 
+def _fit_pi(n: int, w: np.ndarray, N: np.ndarray) -> np.ndarray:
+    """Vectorized Zermelo/MM fixed-point iteration.
+
+    Returns pi (positive, geometric-mean normalised) for n items given:
+      w[i]   — win weight (0.5 virtual tie + actual wins/halves)
+      N[i,j] — symmetric comparison count matrix (N diag = 0)
+    """
+    pi = np.ones(n)
+    for _ in range(10000):
+        S = pi[:, None] + pi[None, :]          # n×n pairwise sums
+        denom = 1.0 / (pi + 1.0) + (N / S).sum(axis=1)
+        new_pi = w / denom
+        new_pi /= np.exp(np.log(new_pi).mean())  # geometric-mean normalise
+        if np.abs(np.log(new_pi) - np.log(pi)).max() < 1e-9:
+            pi = new_pi
+            break
+        pi = new_pi
+    return pi
+
+
 def fit_bt(key_ids: list[str], comparisons: list[dict]) -> dict[str, float]:
     """Regularised MM/Zermelo Bradley-Terry fit. Returns mean-centred log-strengths."""
-    n_keys = len(key_ids)
+    n = len(key_ids)
     idx = {k: i for i, k in enumerate(key_ids)}
 
     # Every key gets one virtual tie against a fictional opponent of strength 1.0.
-    w = [0.5] * n_keys
-    opp: list[dict[int, int]] = [dict() for _ in range(n_keys)]
+    w = np.full(n, 0.5)
+    N = np.zeros((n, n))
 
     for c in comparisons:
         i, j = idx[c["a"]], idx[c["b"]]
-        opp[i][j] = opp[i].get(j, 0) + 1
-        opp[j][i] = opp[j].get(i, 0) + 1
+        N[i, j] += 1.0
+        N[j, i] += 1.0
         if c["result"] == "a":
-            w[i] += 1
+            w[i] += 1.0
         elif c["result"] == "b":
-            w[j] += 1
+            w[j] += 1.0
         else:
             w[i] += 0.5
             w[j] += 0.5
 
-    pi = [1.0] * n_keys
-    for _ in range(10000):
-        new_pi = [0.0] * n_keys
-        for i in range(n_keys):
-            p = pi[i]
-            denom = 1.0 / (p + 1.0)
-            for j, nij in opp[i].items():
-                denom += nij / (p + pi[j])
-            new_pi[i] = w[i] / denom
-
-        gmean = math.exp(sum(math.log(p) for p in new_pi) / n_keys)
-        new_pi = [p / gmean for p in new_pi]
-
-        max_delta = max(
-            abs(math.log(new_pi[i]) - math.log(pi[i])) for i in range(n_keys)
-        )
-        pi = new_pi
-        if max_delta < 1e-9:
-            break
-
-    return {key_ids[i]: math.log(pi[i]) for i in range(n_keys)}
+    pi = _fit_pi(n, w, N)
+    return {key_ids[i]: math.log(float(pi[i])) for i in range(n)}
 
 
-def _nearest_rank_percentile(sorted_vals: list[int], pct: float) -> int:
-    n = len(sorted_vals)
-    rank_idx = max(1, min(n, math.ceil(pct / 100.0 * n)))
-    return sorted_vals[rank_idx - 1]
+
 
 
 def bootstrap_ranks(
@@ -502,24 +501,49 @@ def bootstrap_ranks(
     if iters <= 0 or not comparisons:
         return {}
 
+    n_keys = len(key_ids)
+    idx = {k: i for i, k in enumerate(key_ids)}
     n = len(comparisons)
-    rank_samples: dict[str, list[int]] = {k: [] for k in key_ids}
 
-    for _ in range(iters):
-        resample = [comparisons[rng.randrange(n)] for _ in range(n)]
-        strengths = fit_bt(key_ids, resample)
-        order = sorted(range(len(key_ids)), key=lambda i: (-strengths[key_ids[i]], i))
-        for rank, i in enumerate(order, start=1):
-            rank_samples[key_ids[i]].append(rank)
+    # Pre-compute per-comparison index and win-contribution arrays once.
+    a_arr = np.array([idx[c["a"]] for c in comparisons], dtype=np.intp)
+    b_arr = np.array([idx[c["b"]] for c in comparisons], dtype=np.intp)
+    wa = np.array(
+        [1.0 if c["result"] == "a" else 0.5 if c["result"] != "b" else 0.0
+         for c in comparisons]
+    )
+    wb = np.array(
+        [1.0 if c["result"] == "b" else 0.5 if c["result"] != "a" else 0.0
+         for c in comparisons]
+    )
 
-    result: dict[str, tuple[int, int]] = {}
-    for k in key_ids:
-        ranks = sorted(rank_samples[k])
-        result[k] = (
-            _nearest_rank_percentile(ranks, 2.5),
-            _nearest_rank_percentile(ranks, 97.5),
-        )
-    return result
+    rank_matrix = np.empty((iters, n_keys), dtype=np.intp)
+
+    for t in range(iters):
+        # Identical RNG draws to the original: rng.randrange(n) called n times.
+        sel = np.array([rng.randrange(n) for _ in range(n)], dtype=np.intp)
+
+        a_s, b_s = a_arr[sel], b_arr[sel]
+        w = np.full(n_keys, 0.5)
+        np.add.at(w, a_s, wa[sel])
+        np.add.at(w, b_s, wb[sel])
+        N = np.zeros((n_keys, n_keys))
+        np.add.at(N, (a_s, b_s), 1.0)
+        np.add.at(N, (b_s, a_s), 1.0)
+
+        pi = _fit_pi(n_keys, w, N)
+        strength = np.log(pi)
+        order = np.lexsort((np.arange(n_keys), -strength))
+        ranks = np.empty(n_keys, dtype=np.intp)
+        ranks[order] = np.arange(1, n_keys + 1)
+        rank_matrix[t] = ranks
+
+    sorted_ranks = np.sort(rank_matrix, axis=0)
+    lo_idx = max(1, min(iters, math.ceil(2.5 / 100.0 * iters))) - 1
+    hi_idx = max(1, min(iters, math.ceil(97.5 / 100.0 * iters))) - 1
+    lo_ci = sorted_ranks[lo_idx]
+    hi_ci = sorted_ranks[hi_idx]
+    return {key_ids[i]: (int(lo_ci[i]), int(hi_ci[i])) for i in range(n_keys)}
 
 
 # ----------------------------------------------------------------------------
@@ -1381,8 +1405,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
         ),
     )
     if only is None:
-        target = (
-            args.n if args.n is not None else len(state["comparisons"]) + BIGRAM_SESSION_QUESTIONS
+        target = len(state["comparisons"]) + (
+            args.n if args.n is not None else BIGRAM_SESSION_QUESTIONS
         )
         _run_ask_session(state, path, target, mode)
         if len(state["comparisons"]) >= target:
