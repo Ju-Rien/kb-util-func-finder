@@ -1123,15 +1123,12 @@ class RankPairQueue:
 
 
 def _rank_context(ranking: list[dict]) -> Callable[[str, str], str]:
-    """(id1, id2) -> one header line naming each item's current rank and CI."""
+    """(id1, id2) -> one header line naming each item's current rank."""
     info = {row["id"]: row for row in ranking}
 
     def fmt(item_id: str) -> str:
         row = info[item_id]
-        ci = row["rank_ci"]
-        if ci is None:
-            return f"#{row['rank']}"
-        return f"#{row['rank']} (CI {ci[0]}-{ci[1]})"
+        return f"#{row['rank']}"
 
     def ctx(id1: str, id2: str) -> str:
         return f"current ranks: {fmt(id1)}  vs  {fmt(id2)}"
@@ -1244,7 +1241,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
         if args.mode == "keys":
             state = load_state(path, seed=args.seed)
             universe = CANON_IDS
-            ranking, _ = _build_ranking(state, BOOTSTRAP_DEFAULTS["keys"], fit_unseen=True)
+            ranking, _ = _build_ranking(state, 0, fit_unseen=True)
             compatible = None
 
             def base_render(id1: str, id2: str) -> str:
@@ -1266,9 +1263,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
             if args.allow_crosshand:
                 state["crosshand"] = True
             universe = bigram_universe(state)
-            ranking, _ = _build_bigram_ranking(
-                state, BOOTSTRAP_DEFAULTS["bigrams"], fit_unseen=True
-            )
+            ranking, _ = _build_bigram_ranking(state, 0, fit_unseen=True)
             compatible = lambda a, b: not (is_crosshand(a) and is_crosshand(b))
 
             def base_render(id1: str, id2: str) -> str:
@@ -1524,7 +1519,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="K",
         help="ask a fixed queue of rank-neighbour pairs instead of sampling: fit the "
-             "current ranking (unseen items included, default bootstrap for the mode) "
+             "current ranking (unseen items included) "
              "and compare rank 1 vs 2, 2 vs 3, and so on. K starts the sweep at rank K "
              "instead of rank 1, skipping every better-ranked item (bare flag = 1). "
              "With -n W each item is compared against the next W items in rank order "
